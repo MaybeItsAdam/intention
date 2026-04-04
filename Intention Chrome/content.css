@@ -1,0 +1,117 @@
+/* Scoped to avoid affecting the underlying page */
+#intention-root {
+  all: initial; /* Reset all inherited styles */
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 2147483647;
+  background-color: #0f1115;
+  color: #f0f2f5;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  /* Glassmorphism subtle background */
+  background: radial-gradient(circle at center, #1a1d24 0%, #0f1115 100%);
+}
+
+#intention-root .pw-container {
+  background-color: #1a1d24;
+  border-radius: 16px;
+  padding: 40px;
+  max-width: 500px;
+  width: 90%;
+  border: 1px solid #2d313a;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  text-align: center;
+}
+
+#intention-root h1 {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  color: #f0f2f5;
+  background: linear-gradient(135deg, #a855f7, #6366f1);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+#intention-root p.pw-subtitle {
+  color: #a0a5b1;
+  font-size: 15px;
+  margin-bottom: 24px;
+}
+
+#intention-root input[type="text"],
+#intention-root input[type="number"] {
+  width: 100%;
+  background-color: #0f1115;
+  border: 1px solid #2d313a;
+  color: #f0f2f5;
+  padding: 14px 16px;
+  border-radius: 8px;
+  font-size: 16px;
+  outline: none;
+  transition: border-color 0.2s;
+  margin-bottom: 16px;
+  box-sizing: border-box;
+}
+
+#intention-root input[type="text"]:focus,
+#intention-root input[type="number"]:focus {
+  border-color: #6366f1;
+}
+
+#intention-root .pw-input-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  text-align: left;
+}
+
+#intention-root .pw-input-group label {
+  color: #a0a5b1;
+  font-size: 14px;
+  min-width: 120px;
+}
+
+#intention-root button {
+  width: 100%;
+  background-color: #6366f1;
+  color: white;
+  border: none;
+  padding: 14px 24px;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#intention-root button:hover {
+  background-color: #4f46e5;
+  transform: translateY(-2px);
+}
+
+#intention-root button.pw-secondary-btn {
+  background-color: #2d313a;
+  margin-top: 12px;
+}
+#intention-root button.pw-secondary-btn:hover {
+  background-color: #3f4451;
+}
+
+#intention-root .pw-reason-display {
+  font-size: 18px;
+  font-style: italic;
+  color: #e2e8f0;
+  margin: 20px 0;
+  padding: 16px;
+  background-color: rgba(99, 102, 241, 0.1);
+  border-left: 4px solid #6366f1;
+  border-radius: 4px;
+}

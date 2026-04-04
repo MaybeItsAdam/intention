@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Intention Settings</title>
+  <link rel="stylesheet" href="options.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Intention</h1>
+      <p>Configure your intent-based browsing.</p>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Blocked Websites</h2>
+        <p class="subtitle">Add domains you want to be mindful about (e.g. twitter.com, reddit.com)</p>
+        
+        <div class="input-group">
+          <input type="text" id="domain-input" placeholder="Enter domain...">
+          <button id="add-btn">Add</button>
+        </div>
+
+        <ul id="domain-list">
+          <!-- Populated by JS -->
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>Default Check-in Interval</h2>
+        <p class="subtitle">How often (in minutes) should we interrupt your visit by default?</p>
+        
+        <div class="input-group">
+          <input type="number" id="interval-input" min="1" max="1440" value="5">
+          <span class="label-suffix">minutes</span>
+        </div>
+        <button id="save-settings-btn" class="secondary-btn">Save Settings</button>
+        <div id="save-status"></div>
+      </section>
+    </main>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

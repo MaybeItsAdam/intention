@@ -3,6 +3,15 @@
   "name": "Intention",
   "version": "2.0",
   "description": "AI-powered focus gate. Bring your own LLM to coach you past distracting sites.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "intention@maybeitsadam",
+      "strict_min_version": "121.0"
+    },
+    "gecko_android": {
+      "strict_min_version": "121.0"
+    }
+  },
   "permissions": [
     "storage",
     "alarms",
@@ -17,7 +26,7 @@
     "128": "icon128.png"
   },
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["providers.js", "prompts.js", "tracking.js", "background.js"]
   },
   "content_scripts": [
     {

@@ -15,11 +15,12 @@ The coach runs on **coaching credit**, a one-time top-up bought through the App 
 
 ## How it works
 
-1. You add sites to a blocklist (e.g. `instagram.com`, `x.com`).
+1. You add sites to a blocklist (e.g. `instagram.com`, `x.com`) and, on mobile, apps. An entry can cover the whole thing or only part of it — "Reels but not messages", "all of Reddit except r/rust".
 2. When you open one, the page is paused and a chat opens. Your coach — the LLM you chose — asks what's up.
-3. If you have a real, specific, time-bounded reason, it grants you some minutes. If the reason is hollow ("just checking"), it doesn't — it offers alternatives instead, drawn from what it knows about you.
+3. If you have a real, specific, time-bounded reason, it grants you some minutes — either for the site, or for just the page you named, in which case leaving that page puts the block straight back. If the reason is hollow ("just checking"), it doesn't — it offers alternatives instead, drawn from what it knows about you.
 4. When the time is up, it checks back in. Further grants get exponentially harder; after the daily cap the coach can't grant more, but it'll still talk to you, help you notice the pattern, and cheer you on for closing the tab.
 5. Your context — who you are, what your goals are — can only be updated by talking to the coach. No text field to silently rewrite the rules in a weak moment.
+6. Removing Intention is the biggest loosening there is, so it goes through the same conversation, after a cool-off if you set yourself one. Nothing in it can stop you leaving, and none of it is allowed to try — see [`docs/LEAVING.md`](docs/LEAVING.md), which is also the page the browser opens once Intention is gone.
 
 ## Features
 
@@ -29,9 +30,13 @@ The coach runs on **coaching credit**, a one-time top-up bought through the App 
 - **Context-via-chat guardrail**: the system prompt ("about you") is updated only through a conversation with the coach, using an `update_context` tool. Prevents trivial self-deception.
 - **Time awareness**: the AI sees the current day and time, minutes spent today on this site, this site over the past week, today across all blocked sites, and across the past week.
 - **Track record**: every pass records how it ended — closed early, ran the clock out, asked for more — alongside the reason given for it, and the coach sees the last week of them. "You said ten minutes and closed at four" and "that's the fourth evening running" are things it can actually say.
+- **Blocking part of a site**: a blocklist entry carries a scope — all of it, only these parts, or everything except these parts — so "block Instagram" can mean Reels shut and messages open. Any edit that leaves less of it blocked goes through the coach; tightening saves itself. On the web the part is read off the address, so it works everywhere. Inside the Android app it is read off the app's own screen and is best-effort: a screen Intention cannot recognise blocks the whole app rather than opening it, and it says so at the gate rather than letting a rule fail quietly. Inside an iOS app it is not possible at all — Screen Time hides an app behind a shield and reports nothing about what is on it — and the row says that instead of offering a control that cannot work.
+- **Page-scoped passes**: the coach can grant "this one video" rather than the whole site. The pass ends the moment the address stops matching the page it was granted for — an autoplay into the next video, a swipe back into the feed — and the gate comes back. Where the browser's rule ordering has been verified, the rest of the site keeps its blocking rule while the granted address is allowed through; everywhere else the scope is held by the overlay alone, which is how Safari holds every pass.
 - **Knows where you're going**: the coach is told the specific page — video title, channel and length, thread and subreddit, Instagram/TikTok destination, or the search term you typed. When only the address is known it is told to say so and ask, rather than guess at content it hasn't seen.
 - **Exponential difficulty**: scaling skepticism per grant per day, plus a hard daily cap (3). Past the cap the chat continues for motivational support, but no more time is given out.
 - **Positive reinforcement tone**: the system prompt pushes the AI to be warm, curious, non-judgmental — offering concrete alternatives, naming procrastination gently, celebrating the close-tab choice.
+- **A balance you can see**: the settings header carries a credit chip on every tab, and the gate says so when credit is running low. A balance survives a reinstall, and a recovery code written down beforehand survives the device.
+- **A way out that works**: removal routes through the coach, with an optional cool-off, an exit that is live from the first paint of that conversation, and an export of your list so leaving isn't punitive.
 
 ## Installation
 
@@ -71,11 +76,15 @@ For development or manual installation:
 
 ## First-run setup
 
-On first open, the options page walks you through:
+On first open, the options page walks you through a fixed number of steps — six in a browser, seven on Android, eight on iOS, where turning the Safari extension on and choosing apps in Screen Time each need a screen of their own. The count depends on the build and not on your blocklist: adding a seventh site no longer adds a seventh step.
 
-1. Add starter domains (and, on mobile, apps) to the blocklist.
-2. Tell your coach about yourself — who you are, your work, your goals, what patterns you want to stay mindful of.
-3. Turn the coach on by buying coaching credit.
+1. What Intention is and what it will do.
+2. *(iOS)* Turn the Safari extension on. Only you can do that — iOS gives an app no way to do it for you.
+3. *(mobile)* Which apps pull you in.
+4. Which sites.
+5. What each one is for. One screen, one card per service — a site and its app share a card — answered by tapping chips rather than writing paragraphs: what you genuinely need it for, and what it costs you. A line under each card says back what the coach will do with the answers as you tap them. There's free text underneath for anything more specific, and the whole step can be skipped; the coach can ask later.
+6. How blocking should work: the coach, or simple mode — a hard block, or a self-serve timed pass of a length you set.
+7. Turn the coach on by buying coaching credit. You can also finish without it; your sites and apps stay blocked, you just can't talk your way past them yet.
 
 After that, the options page only exposes the blocklist and access settings directly. Updating your context is done through the **Talk with your coach** button — the coach decides when the context has improved enough to save a new version.
 
@@ -89,9 +98,22 @@ Three states, resolved by `resolveAIRoute()` in `background.js` on every coachin
 | `byok` | A custom API key is set in Settings → Advanced | Straight from the device to that provider |
 | `locked` | Neither | Nowhere — the paywall replaces the chat, and the site stays blocked |
 
-The purchase itself is always the platform's own: StoreKit 2 on Apple (`Intention Apple/Shared (App)/IntentionStore.swift`), Play Billing on Android (`BillingManager.kt`). Browser builds, which have no store to buy through, unlock with a short-lived code minted by the mobile app.
+The purchase itself is always the platform's own: StoreKit 2 on Apple (`Intention Apple/Shared (App)/IntentionStore.swift`), Play Billing on Android (`BillingManager.kt`). Browser builds, which have no store to buy through, unlock with a short-lived code minted by the mobile app; the same box also takes a recovery code.
+
+The balance is shown rather than implied — a credit chip in the settings header on every tab, and a line at the gate when it is running low — and it is meant to survive things going wrong. On a reinstall the app asks the backend whether a balance is held against its store account id (`POST /v1/entitlement/recover`) before showing anyone a paywall. On a device that is gone, the only thread back is a **recovery code**, minted in Settings → AI access on the device that bought the credit and written down while nothing has gone wrong: there is no account behind a balance, no email and nothing to log into, which is the point and also the risk.
 
 `server/` is the backend: it verifies App Store / Play receipts, mints entitlement tokens, and proxies coaching calls. It has no dependencies — `cd server && npm start`. See [`server/README.md`](server/README.md).
+
+## Leaving Intention
+
+Loosening a rule costs a conversation with the coach, and removal is the biggest loosening there is, so it goes through the same mechanism. It is also the one rule you can undo from outside Intention entirely, and the design starts from admitting that.
+
+- **A cool-off you set yourself**, in Settings → Blocking: none, an hour, 24 hours or 3 days. Making it longer saves straight away; making it shorter costs a conversation, like every other rule you wrote for yourself in a calmer moment. It is not a lock — while the wait runs, the card carries a **Remove it now anyway** button, and it works.
+- **One tab, once.** Opening `chrome://extensions` or `about:addons` opens a single Intention tab *beside* it offering that conversation. It never navigates, reloads or closes the page you opened — you may well have gone there for a different extension. Every ending of the conversation, including deciding to stay, buys fifteen minutes of silence, and any visit at all buys ten. On Android the same interposition runs when Settings shows Intention's own App info page or the accessibility entry for its service; it launches over Settings and a Back press dismisses it, which is deliberate.
+- **The exit is never hidden.** "Remove it anyway" is enabled from the first paint of the conversation, is never on a timer, and works whatever the coach says and whatever the cool-off says. If you have run out of coaching credit the conversation still opens — it is the one conversation in Intention that never hands over to the paywall, because "pay us to be allowed to leave" is not a thing this product will do.
+- **Take your list with you.** "Save a copy of your list" writes `intention-list-YYYY-MM-DD.json`: blocked sites and apps, their limits, your setup answers and your coach's context. Not your credit, your key, your stats or any conversation.
+
+`chrome.runtime.setUninstallURL` points at [`docs/LEAVING.md`](docs/LEAVING.md), so that page is the last thing a user sees. It is deliberately on GitHub rather than on Intention's own backend, which logs every request it receives: pointing it there would have turned every removal into an uninstall ping.
 
 ## Privacy
 
@@ -100,7 +122,7 @@ The purchase itself is always the platform's own: StoreKit 2 on Apple (`Intentio
 ## Technology
 
 - Vanilla JavaScript, Manifest V3, HTML + CSS (glassmorphic)
-- `chrome.alarms`, `chrome.storage.local`, `chrome.tabs`, `chrome.runtime`
+- `chrome.alarms`, `chrome.storage.local`, `chrome.tabs`, `chrome.runtime`, `chrome.declarativeNetRequest` (blocking rules, and the per-tab allow rule a page-scoped pass rests on), `chrome.webNavigation`
 - StoreKit 2 (Apple) / Play Billing (Android) for in-app purchases
 - LLM adapters: Intention's hosted backend, Anthropic Messages API, OpenAI (+ Groq) Chat Completions, Gemini generateContent
 - Tool-use-based access grant and context update — no free-text commands
@@ -115,6 +137,12 @@ parity check across the three variants and a browser-based overlay dev harness.
 npm install
 npm test
 ```
+
+`npm run test:smoke` is the other half: Playwright against a real Chromium with
+the extension loaded, covering the gate (including a page-scoped grant), the
+wizard, the leaving interposition and text contrast. It is the only thing here
+that runs a browser, so anything a browser decides — rule ordering, whether an
+event fires for a `chrome://` page — is verified there or not at all.
 
 See [`tests/README.md`](tests/README.md) for the full guide (watch mode, the
 overlay harness, and live-loading the extension in Firefox / Chrome / Safari).

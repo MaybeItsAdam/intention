@@ -30,6 +30,7 @@
         "content.css"
       ],
       "js": [
+        "parts.js",
         "page_context.js",
         "report.js",
         "rules.js",
@@ -66,6 +67,7 @@
   },
   "background": {
     "scripts": [
+      "parts.js",
       "sites.js",
       "providers.js",
       "prompts.js",

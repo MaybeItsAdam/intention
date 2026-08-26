@@ -1,5 +1,5 @@
 try {
-  importScripts('sites.js', 'providers.js', 'prompts.js', 'tracking.js', 'page_context.js', 'rules.js');
+  importScripts('parts.js', 'sites.js', 'providers.js', 'prompts.js', 'tracking.js', 'page_context.js', 'rules.js');
 } catch (e) {
   // Firefox loads these via manifest scripts array; globals already present.
 }

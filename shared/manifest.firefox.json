@@ -16,6 +16,7 @@
   },
   "background": {
     "scripts": [
+      "parts.js",
       "sites.js",
       "providers.js",
       "prompts.js",

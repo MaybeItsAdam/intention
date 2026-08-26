@@ -37,10 +37,43 @@ function manifests(dir) {
     const merged = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'));
     return { base: merged, firefox: merged };
   }
+  const firefox = JSON.parse(readFileSync(join(dir, 'manifest.firefox.json'), 'utf8'));
+  assertAppleBackgroundMatches(dir, firefox);
   return {
     base: JSON.parse(readFileSync(join(dir, 'manifest.base.json'), 'utf8')),
-    firefox: JSON.parse(readFileSync(join(dir, 'manifest.firefox.json'), 'utf8'))
+    firefox
   };
+}
+
+// Firefox and Apple each spell their background script list out in full, and
+// scriptContexts() below reads only the Firefox one. That is fine exactly as
+// long as the two lists agree — and once they don't, nothing else notices:
+// ESLint's globals, tests/load.js's vm bundles and the CI file check all
+// resolve through the Firefox list, so a file missing from the Apple overlay
+// lints clean, tests clean, ships, and then throws ReferenceError in Safari's
+// background page and nowhere else.
+//
+// That is not hypothetical. parts.js was added to base, firefox, options.html
+// and Android's background.html and missed here, and every check in the repo
+// stayed green. Reading both and refusing to disagree is the cheapest place to
+// catch it: this module is loaded by ESLint and by the test loader, so the
+// mismatch fails on the next lint rather than on someone's iPhone.
+function assertAppleBackgroundMatches(dir, firefox) {
+  const applePath = join(dir, 'manifest.apple.json');
+  if (!existsSync(applePath)) return;
+  const apple = JSON.parse(readFileSync(applePath, 'utf8'));
+  const appleScripts = apple.background?.scripts;
+  if (!appleScripts) return;
+  const ffScripts = firefox.background?.scripts || [];
+  const missing = ffScripts.filter(f => !appleScripts.includes(f));
+  const extra = appleScripts.filter(f => !ffScripts.includes(f));
+  if (missing.length || extra.length) {
+    throw new Error(
+      'manifest.apple.json background.scripts disagrees with manifest.firefox.json. ' +
+      `Missing from Apple: [${missing.join(', ')}]. Only in Apple: [${extra.join(', ')}]. ` +
+      'Both must list the same files — see the comment above assertAppleBackgroundMatches.'
+    );
+  }
 }
 
 function scriptTags(dir, page) {

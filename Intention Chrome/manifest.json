@@ -29,6 +29,7 @@
         "content.css"
       ],
       "js": [
+        "parts.js",
         "page_context.js",
         "report.js",
         "rules.js",

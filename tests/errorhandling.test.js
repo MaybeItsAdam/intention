@@ -144,17 +144,30 @@ describe('background.js handleChat — malformed tool calls do not lose the turn
   });
 
   it('keeps the turn and history when a tool handler throws outright', async () => {
-    // save_onboarding with blocked_domains as a non-array, so the handler's
-    // `.map()` call throws — exercise the try/catch around each tool call.
+    // update_context's own write fails — the realistic way an executor blows
+    // up, now that every tool input is coerced before it is used. Only the
+    // userContext write is failed, so the transcript persistence below it
+    // still runs and the assertion is about the tool call, not about storage
+    // being broken generally.
     const fetch = makeMockFetch({
       content: [
         { type: 'text', text: 'Got it, all set.' },
-        { type: 'tool_use', id: 't1', name: 'save_onboarding', input: { blocked_domains: { not: 'an array' }, domain_limits: [null, { domain: 'y.com' }] } }
+        { type: 'tool_use', id: 't1', name: 'update_context', input: { new_context: 'I am a writer.', diff_summary: 'added job' } }
       ]
     });
     const { ctx, chrome } = loadBackground({ seed: CONFIGURED, fetch });
+    const realSet = chrome.storage.local.set.bind(chrome.storage.local);
+    chrome.storage.local.set = (obj, cb) => {
+      if ('userContext' in obj) {
+        chrome.runtime.lastError = { message: 'extension context invalidated' };
+        cb();
+        chrome.runtime.lastError = null;
+        return;
+      }
+      realSet(obj, cb);
+    };
     const res = await ctx.handleMessage(
-      { action: 'chat', mode: 'setup', userMessage: 'done' },
+      { action: 'chat', mode: 'context', userMessage: 'here is who I am' },
       {}
     );
     expect(res.error).toBeUndefined();
@@ -162,7 +175,8 @@ describe('background.js handleChat — malformed tool calls do not lose the turn
     // chat; the spoken reply and the persisted transcript both stay clean.
     expect(res.assistantText).toBe('Got it, all set.');
     expect(res.systemNote).toMatch(/something went wrong/i);
-    const history = chrome.storage._store.chatHistories['setup'];
+    expect(res.contextUpdated).toBeFalsy();
+    const history = chrome.storage._store.chatHistories['context'];
     expect(history).toBeDefined();
     expect(history.at(-1).content).toBe('Got it, all set.');
   });

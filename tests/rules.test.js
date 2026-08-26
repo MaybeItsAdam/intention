@@ -64,6 +64,78 @@ describe('normalizeLooseUntil', () => {
   });
 });
 
+describe('the leaving cool-off', () => {
+  it('offers exactly four rungs, off first and longest last', () => {
+    expect(R.LEAVE_DELAY_CHOICES).toEqual([0, 60, 1440, 4320]);
+  });
+
+  it.each([
+    [0, 0],
+    [60, 60],
+    [1440, 1440],
+    [4320, 4320]
+  ])('leaves the choice %i alone', (input, expected) => {
+    expect(R.normalizeLeaveDelay(input)).toBe(expected);
+  });
+
+  // The direction is the entire point of the function, so it gets its own
+  // test rather than a line in a table. Rounding to the NEAREST rung would let
+  // a hand-edited or corrupted 900 become a 24-hour wait nobody agreed to —
+  // this number stands between a person and the exit, and the only safe way
+  // for it to be wrong is short.
+  it.each([
+    [1, 0, 'a minute'],
+    [59, 0, 'just under an hour'],
+    [61, 60, 'just over an hour'],
+    [900, 60, 'most of a day'],
+    [1439, 60, 'a minute under a day'],
+    [4319, 1440, 'a minute under three days'],
+    [99999, 4320, 'far beyond the longest choice']
+  ])('snaps %i DOWN to %i (%s), never up', (input, expected) => {
+    expect(R.normalizeLeaveDelay(input)).toBe(expected);
+  });
+
+  it.each([
+    [undefined, 'never written'],
+    [null, 'explicitly cleared'],
+    ['', 'an emptied input'],
+    ['soon', 'prose'],
+    [NaN, 'a failed parse'],
+    [Infinity, 'an overflow'],
+    [-60, 'a negative'],
+    [{}, 'an object']
+  ])('reads %s (%s) as no delay at all', (input) => {
+    expect(R.normalizeLeaveDelay(input)).toBe(0);
+  });
+
+  // A string is what a dataset attribute hands back, and the settings card
+  // reads the choice straight off one.
+  it('reads a numeric string the way the pill supplies it', () => {
+    expect(R.normalizeLeaveDelay('1440')).toBe(1440);
+  });
+
+  it.each([
+    [60, 'an hour'],
+    [1440, '24 hours'],
+    [4320, '3 days']
+  ])('formats %i as "%s"', (input, expected) => {
+    expect(R.formatLeaveDelay(input)).toBe(expected);
+  });
+
+  // Empty, not "no delay": every caller either has its own sentence for that
+  // case or has nothing to say, and both want a falsy value to test.
+  it.each([[0], [undefined], [null], ['nonsense'], [-5]])(
+    'formats %s as the empty string, so a caller can test it', (input) => {
+      expect(R.formatLeaveDelay(input)).toBe('');
+    });
+
+  // Formatting runs through the same snap, so a stored value that drifted off
+  // the ladder still reads as a real duration rather than as nothing.
+  it('formats an off-ladder value as the rung below it', () => {
+    expect(R.formatLeaveDelay(2000)).toBe('24 hours');
+  });
+});
+
 describe('limitEntryFor', () => {
   const stored = {
     domainLimits: { 'instagram.com': { maxGrants: 1 } },

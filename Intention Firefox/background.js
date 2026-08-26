@@ -142,14 +142,32 @@ async function enforceGateBackstop(tabId, url) {
   } catch (e) {
     return;
   }
-  const { blockedDomains = [], setupComplete = false, activeSessions = {} } = await getStorage(['blockedDomains', 'setupComplete', 'activeSessions']);
+  const { blockedDomains = [], setupComplete = false, activeSessions = {}, domainLimits = {} } = await getStorage(['blockedDomains', 'setupComplete', 'activeSessions', 'domainLimits']);
   // Before setup there is no blocklist to be on, and the gate page has nothing
   // to coach with. The content script's own setup-needed notice is the right
   // answer there, not a navigation.
   if (!setupComplete) return;
   const matchedDomain = blockedDomains.find(d => hostMatchesDomain(host, d)) || null;
   if (!matchedDomain) return;
-  if (readSession(activeSessions, tabId, matchedDomain)) return;
+  // A part rule can mean this address is not blocked at all — "only Reels on
+  // instagram.com" leaves every other page of the site open, and an open page
+  // never calls markHandled() because there is nothing to handle.
+  //
+  // So this check is load-bearing rather than defensive: without it the
+  // backstop would read "no overlay reported" as "the overlay failed" on every
+  // allowed page, and navigate a page the user was explicitly allowed to be on
+  // to the coach three seconds after it loaded. resolvePartVerdict fails
+  // closed, so anything it cannot evaluate still gates here.
+  if (!resolvePartVerdict(limitEntryFor(matchedDomain, { domainLimits }), url).gated) return;
+  // A live pass stands the backstop down — but only for the page it actually
+  // covers. On Safari this is the second line of defence and there is no DNR
+  // behind it, so a scoped pass whose page the tab has since left has to leave
+  // the backstop armed, or the scope would hold on every platform except the
+  // one where the overlay is the only enforcement there is.
+  // sessionCoversUrl returns true for any session with no scope, which is
+  // every pass granted before this existed and every site pass since.
+  const session = readSession(activeSessions, tabId, matchedDomain);
+  if (session && sessionCoversUrl(session, url)) return;
   // The tab may have moved on during the grace period — only act if it is
   // still sitting on the page this was scheduled for.
   try {
@@ -184,6 +202,50 @@ if (typeof chrome !== 'undefined' && chrome.webNavigation?.onCommitted) {
   }
 }
 
+// The other half of "the address changed": a single-page app calling
+// history.pushState. No request is made, nothing commits, no content script
+// re-runs — and for a page-scoped pass that is precisely the navigation that
+// matters, because a YouTube autoplay into the next video is exactly this.
+//
+// The content script cannot see the call either: it runs in an isolated world
+// in all three engines, so patching history.pushState from here patches a
+// function the page never touches. It polls instead (URL_WATCH_MS in
+// content.js), and this listener is the fast path in front of that poll — a
+// message that arrives in a few milliseconds instead of up to 600.
+//
+// Belt to the content script's braces, never the other way round: Safari's
+// webNavigation support for this event is not something to depend on, and the
+// message is fire-and-forget because a tab with no content script (an
+// extension page, a tab still loading) simply has nothing listening.
+if (typeof chrome !== 'undefined' && chrome.webNavigation?.onHistoryStateUpdated) {
+  try {
+    const extensionOrigin = chrome.runtime.getURL('');
+    chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+      if (details.frameId !== 0 || !details.url) return;
+      if (details.url.startsWith(extensionOrigin) || details.url.startsWith('chrome-extension://') || details.url.startsWith('about:')) return;
+      // The recorded page context is what getIntendedUrl and the coach's page
+      // block both read, and onBeforeNavigate does not fire for a pushState —
+      // so without this the record still describes the page they left, and the
+      // coach would confidently discuss the wrong video.
+      //
+      // No new category of stored data: this is derived from the address
+      // alone, and onBeforeNavigate already records that address for every
+      // ordinary navigation. The guard is for the Android background WebView,
+      // which does not load page_context.js at all.
+      if (typeof extractPageContextFromUrl === 'function') {
+        recordTabPageContext(details.tabId, extractPageContextFromUrl(details.url));
+      }
+      try {
+        chrome.tabs.sendMessage(details.tabId, { action: 'urlChanged', url: details.url }, () => {
+          void chrome.runtime.lastError;
+        });
+      } catch (e) {}
+    });
+  } catch (e) {
+    console.warn(INT_LOG, 'webNavigation onHistoryStateUpdated listener warning:', e);
+  }
+}
+
 if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
   try {
     chrome.tabs.onRemoved.addListener((tabId) => {
@@ -192,6 +254,166 @@ if (typeof chrome !== 'undefined' && chrome.tabs?.onRemoved) {
       persistNavContext();
     });
   } catch (e) {}
+}
+
+// ===========================================================================
+// LEAVING — noticing that someone has opened the page they remove us from
+// ===========================================================================
+//
+// What this is, stated plainly so nobody has to reverse-engineer the intent:
+// when the user opens chrome://extensions (or about:addons), Intention opens
+// ONE tab beside it offering a conversation with the coach. It does not
+// navigate that page, does not close it, does not repeat, and the button that
+// removes Intention is live from the first paint of that conversation. There
+// is no mechanism here that can prevent a removal and none is wanted; see
+// docs/LEAVING.md, which is also what setUninstallURL points at.
+//
+// The negative space matters as much as the code:
+//
+//   * No "management" permission. `chrome.management.onDisabled` /
+//     `onUninstalled` fire for OTHER extensions — our own worker is already
+//     torn down by the time either would fire for us — so the permission buys
+//     a scary install-time warning ("Manage your apps, extensions and themes")
+//     for literally zero capability.
+//   * No declarativeNetRequest rule and no content script. `chrome://` and
+//     `about:` pages are not network requests and cannot be injected into.
+//     `tabs.onUpdated` is the only signal that exists, and it only carries
+//     `tab.url` because we already hold "tabs" for the gate backstop.
+//   * We never touch the extensions tab. The user may well have opened it to
+//     manage a DIFFERENT extension — no API tells us whose row they are
+//     looking at — and taking a page away from someone is squarely the Chrome
+//     Web Store's "must be easily reversible" clause. A second tab is one
+//     keystroke to close.
+//
+// Firefox: about:addons is in the table below and the listener is the same
+// one. Whether Firefox populates `tab.url` for about: pages in onUpdated under
+// the `tabs` permission is NOT verified — `npm run test:smoke` is Chromium
+// only. It is registered, it is guarded, and it fails closed (no match, no
+// tab, nothing happens).
+const REMOVAL_SURFACES = [
+  // Anchored, and each one demands a delimiter or end-of-string after the
+  // path. Without that, `chrome://extensions-internals` — a debugging page
+  // that has nothing to do with removal — matches by prefix, and so does any
+  // future `chrome://extensionsomething`.
+  /^chrome:\/\/extensions(?:[/?#]|$)/i,
+  /^edge:\/\/extensions(?:[/?#]|$)/i,
+  /^brave:\/\/extensions(?:[/?#]|$)/i,
+  /^about:addons(?:[/?#]|$)/i
+];
+
+// Fifteen minutes of silence after EVERY outcome of the leaving conversation —
+// approved, declined, cancelled, or "remove it anyway". Including a decline,
+// and that is the point rather than an oversight: it is what makes this a
+// speed bump instead of a loop. Talk to the coach, decide to stay, go back to
+// the extensions page to do the thing you actually opened it for, and
+// Intention says nothing. This is the property to point a store reviewer at.
+const LEAVE_STAND_DOWN_MS = 15 * 60 * 1000;
+
+// And ten minutes between interpositions even with no conversation had at all
+// — someone toggling another extension on and off, or reloading the page.
+const LEAVE_INTERPOSE_DEBOUNCE_MS = 10 * 60 * 1000;
+
+// The farewell page. Deliberately NOT api.intention.maybeitssoftware.co.uk:
+// the backend writes an access-log line per request, so pointing an uninstall
+// URL at it would make every removal a beacon that told us it happened. That
+// is an uninstall ping, PRIVACY.md forbids it, and no amount of "we don't look
+// at it" makes it not one. GitHub gets the hit; we are never told.
+const LEAVING_DOC_URL = 'https://github.com/MaybeItsSoftware/intention/blob/main/docs/LEAVING.md';
+
+// Pure, so it can be tested without a browser. Anything unparseable is not a
+// removal surface — this decides whether to OPEN a tab, so failing closed
+// costs nothing and failing open is an unexplained tab.
+function isRemovalSurfaceUrl(url) {
+  if (typeof url !== 'string' || !url) return false;
+  return REMOVAL_SURFACES.some(re => re.test(url));
+}
+
+// Whether an interposition is allowed right now, from the stored state alone.
+//
+// Separate from the listener and pure for the same reason isRemovalSurfaceUrl
+// is: this is the whole policy of the feature — every reason Intention stays
+// quiet is one line here — and a policy nobody can read back in a test is a
+// policy that drifts.
+function leaveInterposeAllowed(state, now) {
+  try {
+    if (!state) return false;
+    // Before setup there is nothing to leave, and an empty blocklist means
+    // nothing is being enforced, so there is nothing to have a conversation
+    // about. Both halves matter: a user who has removed every site has
+    // already effectively left, and pestering them about it would be absurd.
+    if (!state.setupComplete) return false;
+    if (!Array.isArray(state.blockedDomains) || state.blockedDomains.length === 0) return false;
+
+    // A conversation already happened. `- now <= LEAVE_STAND_DOWN_MS` caps how
+    // long a stand-down can possibly suppress for: a clock that jumps forward
+    // and back, or a hand-edited value, must not be able to write a silence
+    // that outlives its own length.
+    const standDownUntil = Number(state.leaveStandDown && state.leaveStandDown.until) || 0;
+    if (standDownUntil > now && standDownUntil - now <= LEAVE_STAND_DOWN_MS) return false;
+
+    // They already asked and the coach agreed. Whether the cool-off is still
+    // running or has run out, the answer was yes — opening the conversation
+    // again would be asking someone to justify a decision we have already
+    // accepted, which is exactly the loop this feature must not become.
+    if (state.leaveRequest && Number(state.leaveRequest.availableAt) > 0) return false;
+
+    // The plain debounce, for a visit with no conversation at all. A timestamp
+    // in the future (clock moved back) does not count, or it would silence the
+    // feature until the clock caught up.
+    const last = Number(state.leaveInterposedAt) || 0;
+    if (last > 0 && now >= last && now - last < LEAVE_INTERPOSE_DEBOUNCE_MS) return false;
+
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// One at a time. `tabs.onUpdated` fires more than once for a single visit (the
+// url change, then status 'complete'), and both would otherwise read the
+// stored debounce timestamp before either had written it.
+let leaveInterposeInFlight = false;
+
+async function interposeOnRemovalSurface() {
+  if (leaveInterposeInFlight) return false;
+  leaveInterposeInFlight = true;
+  try {
+    const stored = await getStorage(['setupComplete', 'blockedDomains', 'leaveStandDown', 'leaveInterposedAt', 'leaveRequest']);
+    const now = Date.now();
+    if (!leaveInterposeAllowed(stored, now)) return false;
+    // Written BEFORE the tab opens, so a failure to open still spends the
+    // debounce. A tab that could not be created is not a reason to try again
+    // in two seconds.
+    await setStorage({ leaveInterposedAt: now });
+    const leaveUrl = chrome.runtime.getURL('options.html?leave=1');
+    // Beside the extensions page, never over it. focusOrCreateTab reuses a tab
+    // already on this exact address (a second visit after the stand-down
+    // lapsed) rather than stacking a third one up.
+    await focusOrCreateTab(leaveUrl, () => chrome.tabs.create({ url: leaveUrl }));
+    return true;
+  } catch (e) {
+    console.warn(INT_LOG, 'leave interposition failed:', e);
+    return false;
+  } finally {
+    leaveInterposeInFlight = false;
+  }
+}
+
+if (typeof chrome !== 'undefined' && chrome.tabs?.onUpdated) {
+  try {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+      // Deliberately not webNavigation: its events are not raised for
+      // chrome:// URLs, so onCommitted (which this file already listens on for
+      // the gate backstop) never sees this navigation at all.
+      if (!changeInfo || (!changeInfo.url && changeInfo.status !== 'complete')) return;
+      const url = changeInfo.url || (tab && tab.url) || '';
+      if (!isRemovalSurfaceUrl(url)) return;
+      interposeOnRemovalSurface()
+        .catch(e => console.warn(INT_LOG, 'leave interposition error:', e));
+    });
+  } catch (e) {
+    console.warn(INT_LOG, 'tabs onUpdated listener warning:', e);
+  }
 }
 
 // Sessions, chat history and check-in alarms are keyed per (tab, target) in
@@ -292,13 +514,29 @@ async function focusOrCreateTab(urlPattern, createFn) {
 }
 
 // Which blocked domains currently need a redirect rule. A domain with a live
-// pass gets none, on top of the per-tab session allow rule registered below:
-// belt and braces, because WebKit does not reliably honour a session rule's
-// `tabIds` condition, and when it doesn't the redirect wins and throws the
-// user straight back into the gate they just talked their way through — the
-// "granted, then stuck on the gate forever" loop. The rule comes back when the
-// pass ends (see the callers of syncBlockingRules), and, should the background
-// have been suspended by then, on the next visit to the domain.
+// UNSCOPED pass gets none, on top of the per-tab session allow rule registered
+// below: belt and braces, because WebKit does not reliably honour a session
+// rule's `tabIds` condition, and when it doesn't the redirect wins and throws
+// the user straight back into the gate they just talked their way through —
+// the "granted, then stuck on the gate forever" loop. The rule comes back when
+// the pass ends (see the callers of syncBlockingRules), and, should the
+// background have been suspended by then, on the next visit to the domain.
+//
+// A PAGE-SCOPED pass is the exact opposite case and this filter is the whole
+// of the difference: WHERE THE ORDERING CAN BE RELIED ON it keeps the domain's
+// redirect rule, because the scope only means anything if every OTHER page on
+// that domain still gates. The narrowed allow rule registered for the tab
+// (registerSessionRule) lets the one granted page through past it; a hard
+// navigation to anything else on the site meets the redirect and opens the
+// coach, which is the feature. Dropping the rule here for a scoped pass hands
+// the network layer the whole site while the badge says THIS PAGE ONLY — the
+// single worst failure this package can have, which is why
+// tests/background.test.js pins it.
+//
+// The qualifier is not hedging: keeping the redirect only works if the allow
+// rule beats it, and that ordering is verified on exactly one engine. See
+// allowOutranksRedirect() below for what happens on the others and why the
+// answer there fails in the safer direction.
 async function domainsNeedingRedirect() {
   // Safari takes the rule, honours it, and then can't complete the load:
   // redirecting to `safari-web-extension://…/coaching.html` fails the
@@ -310,11 +548,93 @@ async function domainsNeedingRedirect() {
   // Safari gates from the content script's overlay instead, as it did while
   // these rules were still malformed enough for WebKit to throw them out.
   if (hasNativeMessaging()) return [];
-  const { blockedDomains = [], activeSessions = {} } = await getStorage(['blockedDomains', 'activeSessions']);
+  const { blockedDomains = [], activeSessions = {}, domainLimits = {} } = await getStorage(['blockedDomains', 'activeSessions', 'domainLimits']);
+  // `!s.scope` is what keeps a scoped pass's domain redirect alive — but only
+  // where the narrowed allow rule can actually beat it. See
+  // allowOutranksRedirect(): where it cannot be shown to, a page-scoped pass
+  // drops the redirect exactly as a site pass does, and the scope is enforced
+  // by the content script alone.
+  const keepRedirectForScoped = allowOutranksRedirect();
   const passed = new Set(
-    Object.values(activeSessions).filter(s => activeSession(s)).map(s => s.domain)
+    Object.values(activeSessions)
+      .filter(s => activeSession(s) && (!s.scope || !keepRedirectForScoped))
+      .map(s => s.domain)
   );
-  return blockedDomains.filter(domain => !passed.has(domain));
+  // A host carrying a part rule drops out of the blanket redirect entirely.
+  // The decision on such a host now needs the PATH, and a declarativeNetRequest
+  // rule matching `||host^` cannot see one — it would redirect the parts the
+  // user explicitly left open. Worse, DNR only ever sees a network request, and
+  // instagram.com/reels reached by pushState is not one, so it could never
+  // express "only Reels" correctly even with a narrower filter.
+  //
+  // What replaces it is the content script's overlay plus the backstop above,
+  // which is not a downgrade to something unproven: it is exactly how Safari
+  // gates every blocked site today (hasNativeMessaging() returns [] up there),
+  // so a sectioned host runs on a shipped path rather than a new one.
+  //
+  // v1.5 would keep the redirect for an 'except' rule whose every part carries
+  // a `dnr` filter and add priority-3 `allow` rules beside it, removing the
+  // page flash on the commonest shape ("block Reddit except r/rust"). That is
+  // gated on tests/smoke/gate.smoke.mjs proving Chromium matches `||host/path`
+  // the way the ABP syntax says it does — and, like the scoped-pass construct
+  // above, it would stay off wherever allowOutranksRedirect() says no.
+  return blockedDomains.filter(domain =>
+    !passed.has(domain) && !hasPartRule(limitEntryFor(domain, { domainLimits })));
+}
+
+// May a priority-2 `allow` session rule be trusted to out-rank a priority-1
+// `redirect` dynamic rule for the same navigation?
+//
+// This is load-bearing and it is the reason the question is asked at all. A
+// page-scoped pass is the only construct in the extension that needs the two
+// KINDS of rule to coexist for one host: the domain redirect has to stay up so
+// the rest of the site keeps gating, and the narrowed allow rule has to beat
+// it on the one granted address. Get the ordering wrong and the pass is not
+// merely weak, it is a trap — the granted page redirects to coaching.html,
+// coaching.js sends the user back to grantedSession.scope.url, and that
+// redirects again, for the whole length of a pass they paid a conversation
+// for.
+//
+// Chromium is the one engine whose answer this repo actually has: the DNR spec
+// says a higher-priority `allow` wins, and tests/smoke/gate.smoke.mjs drives a
+// real scoped grant through a real Chromium and asserts the user lands on the
+// granted page. Firefox's MV3 declarativeNetRequest is a partial
+// implementation, this repo runs nothing against it, and the comment that used
+// to sit in this function said so in as many words while the construct it
+// warned about was switched on unconditionally.
+//
+// So the engine that says no is named, by the API only it has:
+// runtime.getBrowserInfo is Firefox's and exists nowhere else. Safari never
+// reaches here (hasNativeMessaging() returns [] above) and Android has no
+// declarativeNetRequest at all, which leaves Chromium — the engine the smoke
+// suite drives — as the yes.
+//
+// It is worth recording what this test is NOT, because the obvious version of
+// it was wrong and the smoke suite is what said so. "Chromium is the runtime
+// with no `browser` namespace" is no longer true: Chrome exposes `browser` as
+// an alias of `chrome`, so `typeof browser === 'undefined'` reported Chromium
+// as unverified and dropped the redirect on the one engine that has been
+// verified. tests/smoke/gate.smoke.mjs now asserts this function's answer
+// against a real browser, so the next detector that quietly stops working
+// fails there rather than in a release.
+//
+// What saying no costs is the smaller half of the asymmetry: the domain
+// redirect goes away for the life of the pass, so the other pages of that site
+// load live and are gated by the content script's overlay instead — which is
+// precisely how Safari gates every blocked site today, and how the scope
+// itself is enforced there. A block held by the overlay rather than by the
+// network layer; not a block dropped. UX-BACKLOG.md carries the item for
+// verifying Firefox and turning this back on there.
+function allowOutranksRedirect() {
+  try {
+    const isFirefox = typeof browser !== 'undefined' && browser.runtime &&
+      typeof browser.runtime.getBrowserInfo === 'function';
+    return !isFirefox;
+  } catch (e) {
+    // Unreadable runtime: take the answer that degrades rather than the one
+    // that leaves a pass resting on an ordering nothing has checked.
+    return false;
+  }
 }
 
 // Rule updates are read-modify-write against the browser's rule store, and
@@ -358,8 +678,15 @@ async function applyBlockingRules() {
     // a rule set with a stale or broken redirect target correct, and left it in
     // place for as long as the blocked list didn't change — which is how a
     // whole platform's gate can break with no way back.
+    //
+    // The action type and priority are in the summary for the same reason the
+    // redirect target is. Once a rule set can contain more than one KIND of
+    // rule for the same filter — an allow beside a redirect, a narrowed rule
+    // beside a whole-domain one — two rule sets that differ in what they
+    // actually DO can agree on every field this compares, and the difference
+    // is then never applied. That failure is silent and it fails open.
     const ruleSummary = rules => rules
-      .map(r => `${r.condition?.urlFilter || ''} -> ${r.action?.redirect?.extensionPath || r.action?.redirect?.url || ''}`)
+      .map(r => `${r.condition?.urlFilter || ''} [${r.action?.type || ''} p${r.priority == null ? '' : r.priority}] -> ${r.action?.redirect?.extensionPath || r.action?.redirect?.url || ''}`)
       .sort()
       .join('\n');
     if (ruleSummary(currentRules) === ruleSummary(addRules)) return;
@@ -399,8 +726,50 @@ async function applyBlockingRules() {
 // Session rules to temporarily allow a tab to visit a domain. No duration:
 // a session rule has no TTL of its own, so the pass ending is what removes it
 // (removeSessionRule), not the clock.
-async function registerSessionRule(tabId, domain) {
+//
+// Takes the SESSION rather than the domain, because a page-scoped pass allows
+// less than the whole domain: its filter names the one granted address, so
+// that where the domain's redirect rule stays in place for a scoped pass (see
+// domainsNeedingRedirect, and allowOutranksRedirect for the engines where it
+// does not) it still catches every other page on the site. Where the redirect
+// has been dropped, this rule is simply harmless: it allows exactly the page
+// nothing was going to redirect anyway.
+//
+// dnrUrlFilterFor returns '' for any address that cannot be expressed safely
+// as a urlFilter, and '' is the ONLY thing it returns other than a filter that
+// matches the address it was built from. Two shapes reach it: a path or query
+// carrying the pattern characters `* ^ |`, and a non-ASCII byte Chrome would
+// reject the whole batch over. (It used to have a third answer for the second
+// shape — drop the query, anchor the path — and that rule could never fire,
+// because a query is the only reason the branch was reached and both ends are
+// anchored. A filter that cannot match its own URL is worse than none: the
+// line below reads any non-empty string as "the narrow rule worked".)
+//
+// '' is a supported answer, not a failure — but it is worth naming why it is
+// SAFE rather than merely tolerated, because the obvious sentence for it ("the
+// content script picks up what the rule misses") is false wherever the redirect
+// actually fires: a DNR redirect diverts the navigation before any content
+// script runs on that origin, so there would be nothing of ours there to pick
+// anything up. It works for the opposite reason. The fallback filter is scoped
+// to `tabIds: [tabId]`, so it clears the priority-1 domain redirect FOR THIS
+// ONE TAB — which is the only thing that lets a content script exist on the
+// page at all, and the content script's own check (sessionCoversUrl, which
+// runs with the worker dead) is then what enforces the scope. That is already
+// how Safari enforces every pass, so it is a shipped path rather than a
+// theoretical one.
+//
+// isUrlFilterCaseSensitive is set, and it is not cosmetic. The default is
+// case-INSENSITIVE, so an allow rule for /p/ABC123/ also let /p/abc123/ past
+// the block — a different Instagram post, since shortcodes are case-sensitive.
+// sessionCoversUrl compares the scope key exactly, so the overlay re-gated a
+// moment later, but the wrong page had already loaded live.
+async function registerSessionRule(tabId, session) {
   try {
+    const domain = session && session.domain;
+    const scopedFilter = session && session.scope && session.scope.url
+      ? dnrUrlFilterFor(session.scope.url)
+      : '';
+    const urlFilter = scopedFilter || `||${domain}^`;
     const ruleId = tabId;
     const addRules = [{
       id: ruleId,
@@ -409,17 +778,18 @@ async function registerSessionRule(tabId, domain) {
         type: 'allow'
       },
       condition: {
-        urlFilter: `||${domain}^`,
+        urlFilter,
+        isUrlFilterCaseSensitive: true,
         tabIds: [tabId],
         resourceTypes: ['main_frame']
       }
     }];
-    
+
     await chrome.declarativeNetRequest.updateSessionRules({
       removeRuleIds: [ruleId],
       addRules
     });
-    console.log(INT_LOG, 'Registered session allow rule for tab', tabId, 'domain', domain);
+    console.log(INT_LOG, 'Registered session allow rule for tab', tabId, 'filter', urlFilter);
   } catch (e) {
     console.error(INT_LOG, 'Error registering session rule:', e);
   }
@@ -433,6 +803,21 @@ async function removeSessionRule(tabId) {
     console.log(INT_LOG, 'Removed session allow rule for tab', tabId);
   } catch (e) {
     console.error(INT_LOG, 'Error removing session rule:', e);
+  }
+}
+
+// A farewell page, not a hook. Chrome/Firefox open this AFTER we are already
+// gone; there is no callback, nothing of ours runs, and it is not fired on a
+// mere disable. It exists so that the last thing Intention does is explain
+// what was on this device, what went with it, and how to get coaching credit
+// back — rather than vanishing and leaving someone to wonder. Registered at
+// top level so it survives every worker restart. See LEAVING_DOC_URL for why
+// it points at GitHub and not at our own backend.
+if (typeof chrome !== 'undefined' && chrome.runtime?.setUninstallURL) {
+  try {
+    chrome.runtime.setUninstallURL(LEAVING_DOC_URL);
+  } catch (e) {
+    console.warn(INT_LOG, 'setUninstallURL warning:', e);
   }
 }
 
@@ -483,15 +868,39 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   removeSessionRule(tabId);
   await syncBlockingRules();
 
+  // WHETHER THE CHECK-IN ACTUALLY WENT UP, not whether the message arrived.
+  //
+  // This used to be a bare try/catch: a throw meant "no content script" and
+  // was the only thing that banked the pass. But the content script has three
+  // arms that decline to render — a gate or an earlier check-in already owns
+  // the page, the address is one the user's own part rule leaves open, or the
+  // pass named here is for a different site than the tab is on — and every one
+  // of them RESOLVED this call. The catch never ran, nothing was banked, and
+  // the session sat in activeSessions with no endedAt while its minutes went
+  // unrecorded in dailyStats and allTimeStats. Nothing repaired it later:
+  // reconcileSessions is only reachable through its own message, which only
+  // the native hosts send.
+  //
+  // So the content script says, and anything that is not an explicit yes is a
+  // no: an older content script, a page with no listener, a throw, a reply
+  // that never came. The domain rides along because a tab may hold passes on
+  // two blocked sites at once and the page has to know which one expired.
+  const { activeSessions: sessionsNow = {} } = await getStorage(['activeSessions']);
+  const expiring = sessionsNow[sessionKey];
+  let shown = false;
   try {
-    await chrome.tabs.sendMessage(tabId, { action: 'showCheckin' });
+    const reply = await chrome.tabs.sendMessage(tabId, { action: 'showCheckin', domain: expiring?.domain });
+    shown = !!(reply && reply.shown);
   } catch (e) {
-    // Tab is gone, or has no content script to show the check-in in — bank the
-    // pass before dropping it. Deleting without banking silently lost every
-    // minute of a pass whose tab disappeared before its check-in: nothing else
-    // ever records a deleted session's time. Sequential awaits on purpose —
-    // bankExpiredSession runs its own mutateStorage, and nesting it inside the
-    // delete's mutator would deadlock the storage queue.
+    shown = false;
+  }
+  if (!shown) {
+    // Nothing on screen will ever end this pass, so bank it before dropping
+    // it. Deleting without banking silently lost every minute of a pass whose
+    // tab disappeared before its check-in: nothing else ever records a deleted
+    // session's time. Sequential awaits on purpose — bankExpiredSession runs
+    // its own mutateStorage, and nesting it inside the delete's mutator would
+    // deadlock the storage queue.
     await bankExpiredSession(sessionKey);
     await mutateStorage('activeSessions', (activeSessions) => {
       delete activeSessions[sessionKey];
@@ -644,7 +1053,7 @@ function hostMatchesDomain(host, domain) {
 // The UI never renders stored history — it opens on an empty chat window — so
 // this changes what the coach remembers, not what the user sees.
 function transcriptKeyFor(mode, { domain, changeType }) {
-  if (mode === 'context' || mode === 'setup') return mode;
+  if (mode === 'context') return mode;
   if (mode === 'settings_gate') return `settings_gate:${changeType}:${domain || 'all'}`;
   if (!domain) return null;
   return `site:${domain}:${dateKey()}`;
@@ -680,7 +1089,7 @@ async function handleMessage(message, sender) {
   // looks under, and the site re-gates the moment the pass is granted.
   const tabId = sender.tab?.id ?? (typeof message.tabId === 'number' ? message.tabId : undefined);
   switch (message.action) {
-    case 'checkPageMatch': return checkPageMatch(message.host, tabId, message.pageContext);
+    case 'checkPageMatch': return checkPageMatch(message.host, tabId, message.pageContext, resolveSenderUrl(sender, message.url));
     // The content script has put Intention's own UI on the page — a gate, a
     // pass badge, or one of the interstitials. Whichever it was, the page is
     // handled and the backstop above has nothing left to do.
@@ -692,16 +1101,50 @@ async function handleMessage(message, sender) {
       // Only extension pages (options, coaching) may read the API key —
       // never content scripts, which run inside arbitrary web pages.
       if (senderTrust(sender) !== 'extension') config.apiKey = '';
+      // And the same rule for the entitlement, for the reason spelled out over
+      // getAccess: the stored object carries `token`, a bearer credential that
+      // can SPEND the balance. getAccess was hardened against exactly this and
+      // getConfig returns the very same object, so leaving it here would have
+      // made that control half a control — the next content-script feature
+      // that wants any part of the config reopens it, and nothing would fail
+      // to say so.
+      //
+      // Content senders only, not `!== 'extension'` as the key above. The
+      // native hosts (Android's BackgroundJsHelper, iOS's BackgroundJSHost)
+      // deliver an empty sender, and on those two platforms our own settings
+      // page reaches the worker through them — options-access.js reconciles a
+      // purchase against this token, so blanking it for 'native' would break
+      // restore on the only builds that sell anything. The stricter line the
+      // apiKey takes above is older than either control and is left as it was.
+      if (senderTrust(sender) === 'content') config.entitlement = null;
       return config;
     }
-    case 'saveSetup': return saveSetup(message.config);
-    case 'saveSettings': return saveSettings(message.config);
-    case 'getAccess': return getAccess();
+    // Both whole-config writers are refused outright for a content sender.
+    // Neither is page-reachable today — a web page cannot send us a runtime
+    // message — but every other privileged action here carries this check, and
+    // an unguarded saveSettings is the widest hole in the file: one message
+    // sets blockedDomains to [] and the product is off. The asymmetry with
+    // applySettingChange three cases down was the only thing making it look
+    // deliberate, so it is closed rather than explained.
+    case 'saveSetup':
+      if (senderTrust(sender) === 'content') return { error: 'Not allowed from a web page' };
+      return saveSetup(message.config);
+    case 'saveSettings':
+      if (senderTrust(sender) === 'content') return { error: 'Not allowed from a web page' };
+      return saveSettings(message.config);
+    case 'getAccess': return getAccess(sender);
     case 'saveEntitlement': return saveEntitlement(message.entitlement);
+    case 'mergeEntitlement': return mergeEntitlement(message.entitlement);
     case 'getSession': {
       if (!message.domain) return { session: null };
       const { activeSessions = {} } = await getStorage(['activeSessions']);
-      return { session: readSession(activeSessions, tabId, message.domain) };
+      const session = readSession(activeSessions, tabId, message.domain);
+      // `covers` answers the second question the caller actually has: does
+      // that pass apply where they were heading? True for every session with
+      // no scope, so a caller that never sends a url sees today's behaviour.
+      // The gate page cannot work this out for itself — coaching.html
+      // deliberately does not load parts.js — so it is answered here.
+      return { session, covers: sessionCoversUrl(session, message.url || '') };
     }
     case 'chat':
       return handleChat({
@@ -722,7 +1165,7 @@ async function handleMessage(message, sender) {
       // site's transcript by naming its key. Everything else clears the
       // transcript for the site the caller is actually on.
       const requested = message.historyKey;
-      const namespaced = requested === 'context' || requested === 'setup' ||
+      const namespaced = requested === 'context' ||
         (typeof requested === 'string' && requested.startsWith('settings_gate:'));
       return clearChatHistory(namespaced
         ? requested
@@ -731,12 +1174,12 @@ async function handleMessage(message, sender) {
     case 'getHistory': {
       // Reading is held to a stricter bar than clearChatHistory's: clearing a
       // guessed key destroys disposable history, but reading one leaks what
-      // the user told their coach. So the fixed namespaces (context/setup/
-      // settings gates) are only readable by our own extension pages, and a
-      // content script can only ever read the transcript of the site it is
-      // actually running on.
+      // the user told their coach. So the fixed namespaces (the context
+      // conversation and the settings gates) are only readable by our own
+      // extension pages, and a content script can only ever read the
+      // transcript of the site it is actually running on.
       const requested = message.historyKey;
-      const namespaced = requested === 'context' || requested === 'setup' ||
+      const namespaced = requested === 'context' ||
         (typeof requested === 'string' && requested.startsWith('settings_gate:'));
       let key;
       if (namespaced && senderTrust(sender) === 'extension') {
@@ -791,8 +1234,11 @@ async function handleMessage(message, sender) {
       if (senderTrust(sender) === 'content') {
         return { error: 'Not allowed from a web page' };
       }
+      // The change types that have no target: they are about the whole
+      // install, so the GLOBAL blocking mode is what decides whether a coach
+      // stands in front of them.
       const { mode } = await getEffectiveMode(
-        message.changeType === 'disable_all' ? null : message.domain
+        GLOBAL_CHANGE_TYPES.includes(message.changeType) ? null : message.domain
       );
       if (mode !== 'simple') return { error: 'This change requires the coach' };
       return applySettingChange({
@@ -800,6 +1246,26 @@ async function handleMessage(message, sender) {
         domain: message.domain,
         newValue: message.newValue
       });
+    }
+    // ---- Leaving ---------------------------------------------------------
+    //
+    // All three are refused outright for a content sender, and that is not
+    // boilerplate: a hostile page that could call 'beginLeave' would spend the
+    // stand-down and silence the interposition for fifteen minutes, and one
+    // that could call 'completeRemoval' would uninstall a self-control tool
+    // out from under its user without a word. Neither is reachable from a
+    // page — these are only ever sent by our own options page.
+    case 'getLeaveState': {
+      if (senderTrust(sender) === 'content') return { error: 'Not allowed from a web page' };
+      return getLeaveState();
+    }
+    case 'beginLeave': {
+      if (senderTrust(sender) === 'content') return { error: 'Not allowed from a web page' };
+      return beginLeave(message.reason);
+    }
+    case 'completeRemoval': {
+      if (senderTrust(sender) === 'content') return { error: 'Not allowed from a web page' };
+      return completeRemoval();
     }
     case 'getBlockInfo':
       return { blockConfig: await getEffectiveMode(message.domain) };
@@ -888,10 +1354,42 @@ async function handleMessage(message, sender) {
   }
 }
 
-async function checkPageMatch(host, tabId, pageContext) {
+// Which address a message from a page is actually about.
+//
+// `sender.url` is the address the browser says the content script is running
+// at, and across origins it wins outright for the same reason `sender.tab`
+// does: a page cannot forge it, and a page that could name its own origin
+// could name an unblocked one.
+//
+// Within one origin it is the WRONG answer, and that is not a subtlety — it is
+// the case this whole feature turns on. Chrome populates `sender.url` from the
+// document the content script was injected into, and an SPA calling
+// history.pushState does not re-inject anything: instagram.com/direct becomes
+// instagram.com/reels with no request, no commit and no new content script, and
+// `sender.url` still says /direct minutes later. Asking the worker "is this
+// page blocked" would then be answered about a page the user left.
+//
+// So: same origin, the message's own address wins, because it is the content
+// script reading window.location.href in the same document the browser vouched
+// for. Different origin, or unparseable, or absent — the sender's.
+function resolveSenderUrl(sender, messageUrl) {
+  const senderUrl = (sender && typeof sender.url === 'string') ? sender.url : '';
+  const claimed = typeof messageUrl === 'string' ? messageUrl : '';
+  if (!senderUrl) return claimed;
+  if (!claimed) return senderUrl;
+  try {
+    if (new URL(claimed).origin === new URL(senderUrl).origin) return claimed;
+  } catch (e) {
+    return senderUrl;
+  }
+  return senderUrl;
+}
+
+async function checkPageMatch(host, tabId, pageContext, url) {
   // Throttled no-op outside the Safari Web Extension runtime — see tracking.js.
   await syncConfigFromNative();
-  const { blockedDomains = [], setupComplete = false, activeSessions = {} } = await getStorage(['blockedDomains', 'setupComplete', 'activeSessions']);
+  const stored = await getStorage(['blockedDomains', 'setupComplete', 'activeSessions', 'domainLimits']);
+  const { blockedDomains = [], setupComplete = false, activeSessions = {} } = stored;
   const matchedDomain = blockedDomains.find(d => host === d || host.endsWith('.' + d)) || null;
   // This is the one moment the page is still intact — the gate has not yet
   // emptied it — so bank what the content script saw before it goes. Only for
@@ -909,16 +1407,46 @@ async function checkPageMatch(host, tabId, pageContext) {
   // native port). Without it the grant is invisible here and the page gates
   // again straight away.
   const session = readSession(activeSessions, tabId, matchedDomain);
+  // Whether that pass covers the page actually being loaded. Always true for a
+  // session with no scope, so this changes nothing for a site pass. The
+  // content script asks parts.js the same question itself against
+  // window.location.href — it has to, because it must reach the same verdict
+  // with the worker dead — and this is here so the two answers cannot come
+  // from two different pieces of logic.
+  const pageUrl = url || (pageContext && typeof pageContext.url === 'string' ? pageContext.url : '');
+  const covered = sessionCoversUrl(session, pageUrl);
+  // Which PART of the site this is, against the rule the user set on it. The
+  // same asymmetry as the session question above: the content script asks
+  // parts.js itself, because it has to reach this verdict with the worker
+  // dead, and this call is here so the two answers cannot come from two
+  // different pieces of logic. An entry with no part rule answers gated:true,
+  // which is what every target has always answered.
+  const partEntry = matchedDomain ? limitEntryFor(matchedDomain, stored) : null;
+  const verdict = resolvePartVerdict(partEntry, pageUrl);
+  // The rule itself, sanitised, for the page to keep. The content script arms
+  // its URL watcher with it: an address that is allowed now can become one that
+  // is not, through a pushState the worker may never hear about, and the page
+  // needs the rule in hand to answer that on its own.
+  const partRule = hasPartRule(partEntry) ? sanitizePartRule(partEntry) : null;
   // A pass that has since expired leaves the domain's redirect rule dropped
   // (see syncBlockingRules) — visiting it again is the moment to notice and
-  // put the rule back. Not awaited: the content script is holding this page's
-  // gate decision open, and the rule only matters from the next load on.
-  if (matchedDomain && !session) syncBlockingRules();
+  // put the rule back. A live pass that does NOT cover this page is the same
+  // situation from the rule set's point of view: this page has to gate, so the
+  // rule has to be there. Not awaited: the content script is holding this
+  // page's gate decision open, and the rule only matters from the next load on.
+  if (matchedDomain && (!session || !covered)) syncBlockingRules();
   const access = await resolveAIRoute();
   const blockConfig = matchedDomain ? await getEffectiveMode(matchedDomain) : null;
   return {
-    isBlocked: !!matchedDomain,
+    // `matchedDomain` still says the host is on the blocklist; `isBlocked` now
+    // says whether THIS address on it is gated. They come apart exactly when a
+    // part rule leaves this page open, and the content script needs both: the
+    // first to know there is a rule worth watching, the second to decide
+    // whether to gate right now.
+    isBlocked: !!matchedDomain && verdict.gated,
     matchedDomain,
+    partId: verdict.partId,
+    partRule,
     setupComplete: !!setupComplete,
     accessRoute: access.route,
     session,
@@ -1050,32 +1578,103 @@ async function saveEntitlement(entitlement) {
     await setStorage({ entitlement: null });
     return { ok: true, entitlement: null };
   }
-  const clean = {
+  const clean = cleanEntitlement(entitlement);
+  await setStorage({ entitlement: clean });
+  return { ok: true, entitlement: clean };
+}
+
+// Merges a patch over whatever is stored at the moment of the write, instead of
+// replacing the whole record with a snapshot the caller read some time ago.
+//
+// saveEntitlement above is a whole-object setStorage, which is right when the
+// caller has just verified a purchase and holds the complete truth. It is wrong
+// on the far side of an unbounded await: options-access.js's recovery reads the
+// entitlement, spends a network round trip on /v1/entitlement/recover, and by
+// the time the answer lands a purchase may have been verified and persisted by
+// a second, concurrent refreshAccessUI (returning from the Play sheet fires
+// 'intention-app-active', which is exactly when a top-up completes). Writing
+// the old snapshot back took the receipt, the token and the balance with it —
+// money taken, access locked, and nothing left to re-verify from.
+//
+// So this goes through mutateStorage, like applyHostedBalance and
+// markEntitlementStale, and only the keys the caller names are written.
+async function mergeEntitlement(patch) {
+  if (!patch || typeof patch !== 'object') {
+    const { entitlement } = await getStorage(['entitlement']);
+    return { ok: false, entitlement: entitlement || null };
+  }
+  let merged = null;
+  await mutateStorage('entitlement', (stored) => {
+    const base = stored && typeof stored === 'object' ? stored : {};
+    merged = cleanEntitlement({ ...base, ...patch });
+    return merged;
+  }, null);
+  return { ok: true, entitlement: merged };
+}
+
+// The write whitelist both of the above share. Anything not named here is
+// silently dropped on every save, which is the point — the page hands us
+// whatever the backend replied with — but it also means a genuinely new field
+// has to be added in exactly one place.
+function cleanEntitlement(entitlement) {
+  return {
     active: !!entitlement.active,
     productId: String(entitlement.productId || ''),
     expiresAt: entitlement.expiresAt ? Number(entitlement.expiresAt) : null,
     source: String(entitlement.source || ''),
     token: String(entitlement.token || ''),
+    // How the session behind that token proved itself, as the server stamped
+    // it. The options page reads it to decide whether a recovery code may be
+    // offered at all (canMintRecoveryCode in billing.js), so like
+    // recoveryCheckedAt below it has to be on this list or it is dropped on
+    // every save and the page re-learns nothing.
+    src: String(entitlement.src || ''),
     receipt: entitlement.receipt || null,
     balanceMicros: Number(entitlement.balanceMicros || 0),
     balanceGbp: Number(entitlement.balanceGbp || 0),
     balanceCredits: Number(entitlement.balanceCredits || 0),
     pendingVerification: !!entitlement.pendingVerification,
     lastError: String(entitlement.lastError || ''),
+    // When this device last asked the backend whether a balance was still
+    // attached to its account id. It has to be on this whitelist or it is
+    // silently dropped on every save — and the options page reads it as the
+    // throttle marker that stops a fresh install re-asking an unauthenticated,
+    // per-IP rate-limited endpoint on every settings open.
+    recoveryCheckedAt: Number(entitlement.recoveryCheckedAt || 0),
     updatedAt: Date.now()
   };
-  await setStorage({ entitlement: clean });
-  return { ok: true, entitlement: clean };
 }
 
-async function getAccess() {
+async function getAccess(sender) {
   const { entitlement, provider, apiKey } = await getStorage(['entitlement', 'provider', 'apiKey']);
   const resolved = await resolveAIRoute();
+  const balanceCredits = Number(entitlement?.balanceCredits || 0);
   return {
     route: resolved.route,
-    entitlement: entitlement || null,
+    // The stored entitlement carries `token` — a bearer credential that can
+    // SPEND the balance, not merely read it. Extension pages need the whole
+    // object (options-access.js reconciles against the receipt and the token);
+    // a content script, which runs inside an arbitrary web page, needs only
+    // the route and the two numbers below. Same rule getConfig applies to
+    // apiKey, and for the same reason.
+    //
+    // This became load-bearing when the gate started painting a credit line:
+    // gate-ui.js asks for this on every blocked page, so without the strip the
+    // token would ride into every content script the extension has.
+    entitlement: senderTrust(sender) === 'content' ? null : (entitlement || null),
     hasCustomKey: !!(apiKey && provider && provider !== HOSTED_PROVIDER),
-    customProvider: provider && provider !== HOSTED_PROVIDER ? provider : ''
+    customProvider: provider && provider !== HOSTED_PROVIDER ? provider : '',
+    // Lifted out of the entitlement so the settings chip and the gate note can
+    // read one number without either of them having to know the entitlement's
+    // shape — and so the content script, which loads no billing code at all,
+    // never receives the balance as anything but this.
+    balanceCredits,
+    // Two exclusions, and both are the point. A custom key has no balance, so
+    // "running low" is meaningless and a warning would be a lie. And a balance
+    // of exactly zero is not LOW, it is LOCKED — a different state with a
+    // different screen behind it, which is why the paywall and not a warning
+    // note is what a zero produces.
+    lowCredit: resolved.route === 'hosted' && balanceCredits > 0 && balanceCredits <= LOW_CREDIT_CREDITS
   };
 }
 
@@ -1112,7 +1711,7 @@ function sanitizeServiceReasons(raw) {
 }
 
 async function getFullConfig() {
-  const keys = ['provider', 'apiKey', 'model', 'userContext', 'contextProjects', 'contextReasons', 'coachInstructions', 'blockedDomains', 'domainLimits', 'blockedApps', 'appLimits', 'appLabels', 'serviceReasons', 'setupComplete', 'entitlement', 'backendUrl', 'blockingMode', 'simpleBehavior', 'simplePassMinutes'];
+  const keys = ['provider', 'apiKey', 'model', 'userContext', 'contextProjects', 'contextReasons', 'coachInstructions', 'blockedDomains', 'domainLimits', 'blockedApps', 'appLimits', 'appLabels', 'serviceReasons', 'setupComplete', 'entitlement', 'backendUrl', 'blockingMode', 'simpleBehavior', 'simplePassMinutes', 'leaveDelayMinutes', 'setupCompletedAt'];
   const stored = await getStorage(keys);
   const access = await resolveAIRoute();
   return {
@@ -1137,29 +1736,200 @@ async function getFullConfig() {
     blockingMode: stored.blockingMode || 'coach',
     simpleBehavior: stored.simpleBehavior || 'pass',
     simplePassMinutes: Number(stored.simplePassMinutes) > 0 ? Number(stored.simplePassMinutes) : 10,
+    // Normalised on the way out, not just on the way in: this is the number
+    // the settings card paints its selected choice from, and a stored value
+    // that is not on the ladder must show as the rung below it rather than as
+    // nothing selected. normalizeLeaveDelay only ever snaps down.
+    leaveDelayMinutes: normalizeLeaveDelay(stored.leaveDelayMinutes),
+    setupCompletedAt: Number(stored.setupCompletedAt) || 0,
     providers: PROVIDERS
   };
 }
 
-async function saveSetup({ provider, apiKey, model, userContext, contextProjects, contextReasons, blockedDomains, domainLimits, blockedApps, appLimits, appLabels, serviceReasons, blockingMode, simpleBehavior, simplePassMinutes }) {
-  await setStorage({
-    provider: provider || '',
-    apiKey: apiKey || '',
-    model: model || (provider ? PROVIDERS[provider]?.defaultModel : '') || '',
-    userContext: userContext || '',
-    contextProjects: contextProjects || '',
-    contextReasons: contextReasons || '',
-    blockedDomains: blockedDomains || [],
-    domainLimits: domainLimits || {},
-    blockedApps: blockedApps || [],
-    appLimits: appLimits || {},
-    appLabels: appLabels || {},
-    serviceReasons: sanitizeServiceReasons(serviceReasons),
-    blockingMode: blockingMode || 'coach',
-    simpleBehavior: simpleBehavior === 'hard' ? 'hard' : 'pass',
-    simplePassMinutes: Number(simplePassMinutes) > 0 ? Number(simplePassMinutes) : 10,
-    setupComplete: true
-  });
+// Every part rule on its way into storage, cleaned by parts.js.
+//
+// The options page is the only thing that writes one today, but "the only
+// caller is careful" is how a validated field stops being validated. This is
+// the choke point instead: both entry points that write a limits map run
+// through it, so sanitizePartRule's caps (20 parts, 96 chars, no unparseable
+// ids) hold however the map arrived — including from an older build's draft,
+// or a settings page a future package writes.
+//
+// An entry that carries neither key comes back BYTE-IDENTICAL. That is the
+// whole backward-compatibility story for this feature: absence is the third
+// state, so an untouched entry is not rewritten, and there is no migration.
+function sanitizeLimitsPartRules(limits) {
+  if (!limits || typeof limits !== 'object') return limits;
+  const out = {};
+  for (const [target, entry] of Object.entries(limits)) {
+    if (!entry || typeof entry !== 'object') { out[target] = entry; continue; }
+    if (!('scope' in entry) && !('parts' in entry)) { out[target] = entry; continue; }
+    const clean = sanitizePartRule(entry);
+    const next = { ...entry };
+    // A rule that decides nothing is stored as no rule at all, both keys gone,
+    // so the entry reads exactly as it did before the feature existed.
+    if (hasPartRule(clean)) {
+      next.scope = clean.scope;
+      next.parts = clean.parts;
+    } else {
+      delete next.scope;
+      delete next.parts;
+    }
+    out[target] = next;
+  }
+  return out;
+}
+
+// The DIRECTION half of the same choke point.
+//
+// A part rule is the one field on a row whose direction is not implied by the
+// gesture that changes it: adding an id to an 'only' list blocks MORE, adding
+// the same id to an 'except' list blocks LESS, and removing one flips both.
+// options-rows.js asks parts.js (partEditIsLoosening) before it decides
+// whether to save straight away or send the user to the coach — and until this
+// existed, that test ran entirely in the caller. saveSettings then wrote
+// whatever map it was handed. One runtime message, typed into the extension's
+// own devtools console by the person the product exists to protect —
+// saveSettings with { domainLimits: { 'instagram.com': { scope: 'only',
+// parts: ['instagram:dms'] } } } — opened all of Instagram but the DMs with no
+// conversation at all. The coach gate on widening a rule was a UI convention,
+// not a rule.
+//
+// Same argument and same remedy as the leaveDelayMinutes clamp in saveSettings
+// below, which says it outright: the choke point belongs at the receiving end,
+// because "the only caller is careful" is how a guarded field stops being
+// guarded. It applied verbatim here and was not applied.
+//
+// What this does NOT do is refuse the whole write. Only the part rule is held
+// back; every other field on the entry (the daily max, the loose window, the
+// mode) lands as it was sent. One save carries the entire limits map, so
+// rejecting it outright would throw away unrelated tightenings made in the
+// same breath. The rule already in storage stays exactly as it was, which is
+// the direction to fail in: the block holds, and the row repaints from storage
+// on the rerender that follows every save.
+//
+// The coach-approved path never passes through here. applySettingChange writes
+// the approved rule to storage itself, which is what makes approval mean
+// something this cannot undo.
+function holdPartRuleDirection(next, stored) {
+  if (!next || typeof next !== 'object') return next;
+  const before = (stored && typeof stored === 'object') ? stored : {};
+  const out = {};
+  for (const [target, entry] of Object.entries(next)) {
+    if (!entry || typeof entry !== 'object') { out[target] = entry; continue; }
+    const prior = before[target];
+    if (!partEditIsLoosening(prior, entry)) { out[target] = entry; continue; }
+    // Put back what was stored — which for a target that had no rule at all
+    // means deleting both keys, so the entry stays byte-identical to what
+    // shipped before this feature, exactly as sanitizeLimitsPartRules does.
+    const kept = sanitizePartRule(prior);
+    const held = { ...entry };
+    if (hasPartRule(kept)) {
+      held.scope = kept.scope;
+      held.parts = kept.parts;
+    } else {
+      delete held.scope;
+      delete held.parts;
+    }
+    out[target] = held;
+  }
+  return out;
+}
+
+// The two steps every write of a limits map runs, in the order they have to
+// run in: clean the rule, then refuse to let it loosen. Sanitising first is
+// not cosmetic — the direction test has to be asked about the rule that will
+// actually be stored, not the one that was sent, or a widening hidden behind
+// twenty junk ids would be compared as something else entirely.
+async function limitsForWrite(key, limits) {
+  const cleaned = sanitizeLimitsPartRules(limits);
+  const stored = (await getStorage([key]))[key];
+  return holdPartRuleDirection(cleaned, stored);
+}
+
+// AN OMITTED KEY MEANS "LEAVE IT ALONE"; a key that is present, even as '',
+// means "write this".
+//
+// The distinction is the wizard's only defence for the fields it deliberately
+// does not send. options-wizard.js omits userContext, contextProjects and
+// contextReasons — setup no longer asks the two general questions — with a
+// comment saying that sending '' there would wipe context an existing user had
+// built up with the coach. That comment described an intention this function
+// did not honour: every field below was written unconditionally, so `|| ''`
+// turned "not mentioned" into "cleared" and the omission bought nothing. The
+// same shape covered every other field: an omitted blockedDomains cleared the
+// blocklist, an omitted appLabels dropped every app's human name.
+//
+// Reachability, honestly: nothing in the shipped UI can reach it today.
+// showSetupView() runs only while `setupComplete` is falsy (options.js), and
+// no code path anywhere writes that key back to false or clears storage — the
+// Apple bridge only ever merges keys the native store actually HAS
+// (AppGroupStorage.get skips absent ones), so it cannot clear it either. The
+// fix is here anyway, and not out of caution about a hypothetical: a defence
+// the wizard believes it has and does not is worse than no defence, because
+// the next field somebody decides to "just leave out" will be trusted to the
+// same rule. Making the code do what the comment already claims is cheaper
+// than keeping the two apart.
+async function saveSetup(config) {
+  const {
+    provider, apiKey, model, userContext, contextProjects, contextReasons,
+    blockedDomains, domainLimits, blockedApps, appLimits, appLabels,
+    serviceReasons, blockingMode, simpleBehavior, simplePassMinutes
+  } = config || {};
+  // The second whole-key writer of both limits maps, and it gets the same
+  // treatment as saveSettings for the same reason: nothing about "this message
+  // came from the wizard" is verifiable at this end. On a first run the stored
+  // maps are empty and every rule is compared against "all of it blocked",
+  // which is what the wizard writes anyway — it has never offered a part rule.
+  // On a re-run it is the guard that stops finishing setup a second time from
+  // being the way to widen a rule the coach refused an hour ago.
+  const cleanDomainLimits = await limitsForWrite('domainLimits', domainLimits || {});
+  const cleanAppLimits = await limitsForWrite('appLimits', appLimits || {});
+
+  const write = {};
+  // `key in config` rather than a truthiness test: '' and [] are real answers
+  // the wizard is entitled to give, and only absence means "not mine to say".
+  const given = (key) => !!config && Object.prototype.hasOwnProperty.call(config, key);
+  const put = (key, value) => { if (given(key)) write[key] = value; };
+
+  put('provider', provider || '');
+  put('apiKey', apiKey || '');
+  put('model', model || (provider ? PROVIDERS[provider]?.defaultModel : '') || '');
+  put('userContext', userContext || '');
+  put('contextProjects', contextProjects || '');
+  put('contextReasons', contextReasons || '');
+  put('blockedDomains', blockedDomains || []);
+  put('blockedApps', blockedApps || []);
+  put('appLabels', appLabels || {});
+  put('serviceReasons', sanitizeServiceReasons(serviceReasons));
+  put('blockingMode', blockingMode || 'coach');
+  put('simpleBehavior', simpleBehavior === 'hard' ? 'hard' : 'pass');
+  put('simplePassMinutes', Number(simplePassMinutes) > 0 ? Number(simplePassMinutes) : 10);
+  // The two limits maps take the same rule as everything else, and they have to
+  // — an omitted domainLimits cleaned to `{}` and written would strip every
+  // blocked site's grant and minute caps while leaving the sites themselves
+  // blocked, which is the loosening this whole path exists to refuse. The
+  // direction guard above still runs on whatever WAS sent, regardless.
+  put('domainLimits', cleanDomainLimits);
+  put('appLimits', cleanAppLimits);
+  // The one thing finishing setup always asserts.
+  write.setupComplete = true;
+
+  // When they started. The leaving conversation is the only thing that reads
+  // it, and it reads it to say "you set this up 40 days ago" rather than to
+  // count anything — a fact about their own install, kept on their own device,
+  // never sent anywhere. Existing installs have no such key and fall back to
+  // the earliest day in dailyStats (see handleChat), which is the same answer
+  // arrived at from data that was already there.
+  //
+  // Written ONCE, which is the difference between "when they started" and
+  // "when they last pressed Finish". Overwriting it would tell the coach a
+  // forty-day install was a fresh one, on the one screen where how long they
+  // have been at this is the argument.
+  const { setupCompletedAt = 0 } = await getStorage(['setupCompletedAt']);
+  if (!(Number(setupCompletedAt) > 0)) write.setupCompletedAt = Date.now();
+
+  await setStorage(write);
   await syncBlockingRules();
   return { ok: true };
 }
@@ -1170,8 +1940,42 @@ async function saveSettings(partial) {
   if (partial && partial.serviceReasons) {
     partial = { ...partial, serviceReasons: sanitizeServiceReasons(partial.serviceReasons) };
   }
+  // The two keys that carry part rules: cleaned, and then held to the
+  // direction they are allowed to move in (limitsForWrite). See
+  // sanitizeLimitsPartRules — an entry without a rule is returned untouched,
+  // so this cannot rewrite settings that predate the feature — and
+  // holdPartRuleDirection for why the direction test cannot live in the page
+  // that calls this.
+  if (partial && partial.domainLimits) {
+    partial = { ...partial, domainLimits: await limitsForWrite('domainLimits', partial.domainLimits) };
+  }
+  if (partial && partial.appLimits) {
+    partial = { ...partial, appLimits: await limitsForWrite('appLimits', partial.appLimits) };
+  }
+  // The cool-off on leaving is the one setting that may only move one way
+  // through here. Raising it is a tightening and free, like lowering a daily
+  // max; SHORTENING it is a loosening and costs a conversation
+  // (applySettingChange's 'decrease_leave_delay' branch, which is the only
+  // thing that ever writes a smaller value).
+  //
+  // The choke point is here rather than in the options page because "the only
+  // caller is careful" is how a guarded field stops being guarded. Every
+  // extension page can reach saveSettings; without this, the gate is a UI
+  // convention rather than a rule.
+  if (partial && 'leaveDelayMinutes' in partial) {
+    const { leaveDelayMinutes: currentDelay } = await getStorage(['leaveDelayMinutes']);
+    const current = normalizeLeaveDelay(currentDelay);
+    const next = normalizeLeaveDelay(partial.leaveDelayMinutes);
+    partial = { ...partial, leaveDelayMinutes: Math.max(current, next) };
+  }
   await setStorage(partial);
-  if (partial.blockedDomains) {
+  // domainLimits joins blockedDomains here because WHICH domains get a redirect
+  // rule now depends on it: a host that has just been given a part rule has to
+  // drop out of domainsNeedingRedirect(), and one whose rule was just removed
+  // has to come back. Without this a section rule set in Settings would not
+  // take effect until something else happened to re-sync — a grant, a tab
+  // closing, the next visit — which is a rule that looks saved and is not.
+  if (partial.blockedDomains || partial.domainLimits) {
     await syncBlockingRules();
   }
   return { ok: true };
@@ -1180,8 +1984,14 @@ async function saveSettings(partial) {
 // Keeps a "credit remaining" indicator live after every message, rather than
 // only updating the next time the settings page reconciles. Called after each
 // successful hosted LLM call — a coaching turn can now involve two.
+//
+// Returns the balance it just wrote, so the caller can hand it straight back
+// to the gate. Without that the gate would have to ask getAccess after every
+// single turn to find out what it already caused, which is a second round trip
+// per message for a number the response was carrying all along. `null` on any
+// route with no balance behind it, which the caller must not flatten to 0.
 async function applyHostedBalance(access, llmResponse) {
-  if (access.route !== 'hosted') return;
+  if (access.route !== 'hosted') return null;
   await mutateStorage('entitlement', (entitlement) => {
     if (!entitlement || typeof entitlement !== 'object') return entitlement;
     return {
@@ -1192,6 +2002,7 @@ async function applyHostedBalance(access, llmResponse) {
       updatedAt: Date.now()
     };
   }, null);
+  return Number(llmResponse.balanceCredits || 0);
 }
 
 // Settings-gate change types whose `domain` is an app target (an Android
@@ -1200,7 +2011,58 @@ async function applyHostedBalance(access, llmResponse) {
 // has to come from appLabels, and the app context block replaces the page one.
 // The reason-box edits are deliberately absent — they exist on site rows and
 // app rows alike, so the options page tells us which with `isApp` instead.
-const APP_CHANGE_TYPES = ['remove_app', 'increase_app_limit', 'increase_app_loose_window'];
+const APP_CHANGE_TYPES = ['remove_app', 'increase_app_limit', 'increase_app_loose_window', 'narrow_app_block_scope'];
+
+// Settings-gate change types with no target at all: they are about the whole
+// install rather than one site or app. `domain` is null for every one of them,
+// which decides three things — which blocking mode gates them (the global one,
+// since there is no per-item override to read), that the prompt must not
+// render a per-domain usage line, and that nothing may look them up in
+// appLabels.
+const GLOBAL_CHANGE_TYPES = ['disable_all', 'uninstall', 'decrease_leave_delay'];
+
+// The two change types whose value is a part rule ({ scope, parts }) rather
+// than a number or a string. They need naming once because the settings gate
+// has to hand the coach a SENTENCE — "all of instagram.com" becoming "only
+// Reels and Explore on instagram.com" — where every other change type can pass
+// its raw value straight through. An object reaching composeSystemPrompt's
+// {{current_value}} token renders as "[object Object]", which is the coach
+// quoting a JavaScript artefact at the user at the exact moment it is asking
+// them to justify a change.
+const SCOPE_CHANGE_TYPES = ['narrow_block_scope', 'narrow_app_block_scope'];
+
+// What the coach is told about the part rule in force here, as PRE-RENDERED
+// strings. Computed in background.js and never in prompts.js, for the reason
+// stated over the pageScope resolution below: tests/load.js composes the
+// prompt bundle as [rules.js, prompts.js], so prompts.js calling parts.js
+// breaks every prompt test — and on Android it would be a ReferenceError in
+// the background WebView.
+//
+// Returns null when there is no rule to describe, which is every target that
+// existed before this feature and most targets after it.
+//
+//   scope       the stored rule, degraded to 'all' by resolvePartVerdict
+//               whenever this build could not evaluate what was stored.
+//   hereLabel   the part this URL landed in, when it landed in one. Under an
+//               'only' rule at the gate this is always set and is the whole
+//               point: "you're on Reels, which you told me to keep closed".
+//               Under an 'except' rule at the gate it is null by construction
+//               — being outside every exception is why the gate is open.
+//   listLabels  the parts the rule names, in the words Settings shows.
+function describePartContext(entry, url) {
+  try {
+    const verdict = resolvePartVerdict(entry, url);
+    if (!hasPartRule(entry) || verdict.scope === 'all') return null;
+    const clean = sanitizePartRule(entry);
+    return {
+      scope: verdict.scope,
+      hereLabel: verdict.partId ? partLabel(verdict.partId) : null,
+      listLabels: clean.parts.map(partLabel).filter(Boolean)
+    };
+  } catch (e) {
+    return null;
+  }
+}
 
 async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, changeType, currentValue, newValue, pageContext }) {
   const { userContext, contextProjects, contextReasons, coachInstructions, coachObservations = [], serviceReasons = {} } = await getStorage(['userContext', 'contextProjects', 'contextReasons', 'coachInstructions', 'coachObservations', 'serviceReasons']);
@@ -1236,6 +2098,27 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       pageCtx = await enrichPageContext(pageCtx);
     } catch (e) {}
   }
+
+  // Whether this destination is one page or an endless middle, resolved once
+  // for both prompt builders and again inside the grant_access branch (which
+  // must resolve it at grant time, after any enrichment, rather than trust a
+  // value computed a turn earlier). null means "no scoped pass here", which is
+  // the ordinary answer for a feed, for every app target, and for most of the
+  // web. pageScopeFor lives in parts.js — never in prompts.js, which does not
+  // load it and must not start.
+  const pageScope = (!isAppTarget && pageCtx && typeof pageCtx.url === 'string')
+    ? pageScopeFor(pageCtx.url, pageCtx)
+    : null;
+
+  // Which part of the site they are on, and what they told Intention to do
+  // about it. Web targets only, and deliberately so: on Android the part would
+  // have to come from reading the app's own screen, which this build does not
+  // do (see the plan's cut line), and on iOS the Screen Time shield hides a
+  // whole app behind an opaque token so there is no part to name at all. An
+  // app target is therefore told nothing rather than told a guess.
+  const partContext = (!isAppTarget && pageCtx && typeof pageCtx.url === 'string')
+    ? describePartContext(limitEntryFor(domain, await getStorage(['domainLimits'])), pageCtx.url)
+    : null;
 
   // For apps, `domain` is the storage/stats key (an Android package name, or
   // the pseudo-target "apps" for the iOS Screen Time pass); prompts get a
@@ -1290,7 +2173,9 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       walkedAwayWeek: stats.walkedAwayWeek,
       observations: coachObservations,
       pageContext: pageCtx,
-      appContext: appCtx
+      appContext: appCtx,
+      pageScope,
+      partContext
     });
     tools = [GRANT_TOOL, NOTE_OBSERVATION_TOOL];
   } else if (mode === 'checkin') {
@@ -1309,6 +2194,10 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       siteReason,
       coachInstructions,
       originalReason: session.reason,
+      // What the pass that just ran out was pinned to, if anything. Read off
+      // the ended session rather than recomputed, because by check-in time the
+      // tab may be somewhere else entirely.
+      endedScope: session.scope || null,
       grantsToday: stats.grantsToday,
       grantsCap: limits.maxGrants,
       minutesCap: limits.maxMinutes,
@@ -1323,16 +2212,49 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       walkedAwayWeek: stats.walkedAwayWeek,
       observations: coachObservations,
       pageContext: pageCtx,
-      appContext: appCtx
+      appContext: appCtx,
+      pageScope,
+      partContext
     });
     tools = [GRANT_TOOL, NOTE_OBSERVATION_TOOL];
   } else if (mode === 'settings_gate') {
     const stats = await getStatsForDomain(domain);
+    // A part rule is the one change value that is an object. Rendered to the
+    // same sentence Settings shows ("all of instagram.com" -> "only Reels on
+    // instagram.com") HERE, so prompts.js never has to know what a part is and
+    // never has to reach into parts.js to find out. `newValue` itself is left
+    // alone: applySettingChange below writes the real rule from the real
+    // object, and must not be handed prose.
+    const isScopeChange = SCOPE_CHANGE_TYPES.includes(changeType);
+    // The leaving conversation is about the install, not about a target, so it
+    // is the one settings gate that needs the aggregate picture: how long they
+    // have been at this and how much is on their list. Read only for the two
+    // change types that use it — every other gate would be paying for a
+    // storage read it never renders.
+    const isLeaveChange = changeType === 'uninstall' || changeType === 'decrease_leave_delay';
+    let leaveFacts = {};
+    if (isLeaveChange) {
+      const leaveStored = await getStorage(['blockedDomains', 'blockedApps', 'leaveDelayMinutes', 'setupCompletedAt', 'dailyStats']);
+      // When they started. `setupCompletedAt` is written by saveSetup, so
+      // anyone who set Intention up before that key existed has none — and
+      // the earliest day they have usage for is the same answer reached from
+      // data that was already on the device. Zero either way is "today",
+      // which renderRemovalBlock says in words rather than as "0 days ago".
+      const dayKeys = Object.keys(leaveStored.dailyStats || {}).sort();
+      let startedAt = Number(leaveStored.setupCompletedAt) || 0;
+      if (!startedAt && dayKeys.length) startedAt = Date.parse(`${dayKeys[0]}T00:00:00`) || 0;
+      leaveFacts = {
+        leaveDelayMinutes: normalizeLeaveDelay(leaveStored.leaveDelayMinutes),
+        blockedSites: (leaveStored.blockedDomains || []).length,
+        blockedApps: (leaveStored.blockedApps || []).length,
+        daysActive: startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 86400000)) : 0
+      };
+    }
     systemPrompt = buildSettingsGateSystemPrompt({
       domain: displayName,
       changeType,
-      currentValue,
-      newValue,
+      currentValue: isScopeChange ? describeScopeForHuman(currentValue, displayName) : currentValue,
+      newValue: isScopeChange ? describeScopeForHuman(newValue, displayName) : newValue,
       userContext,
       contextProjects,
       contextReasons,
@@ -1341,15 +2263,18 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       minutesTodaySite: stats.minutesToday,
       minutesTodayAll: stats.minutesTodayAll,
       minutesWeekAll: stats.minutesWeekAll,
-      reasonsToday: stats.reasonsToday
+      reasonsToday: stats.reasonsToday,
+      ...leaveFacts
     });
-    tools = [APPROVE_CHANGE_TOOL];
+    // Same tool name, different description. APPROVE_CHANGE_TOOL's own text
+    // carries half the scepticism of an ordinary gate ("The default answer is
+    // NO"), and a model reads a tool description as attentively as a system
+    // prompt — so handing it to the leaving conversation would quietly undo
+    // every word of the uninstall branch. See APPROVE_REMOVAL_TOOL.
+    tools = [changeType === 'uninstall' ? APPROVE_REMOVAL_TOOL : APPROVE_CHANGE_TOOL];
   } else if (mode === 'context') {
     systemPrompt = buildContextSystemPrompt({ currentContext: userContext });
     tools = [UPDATE_CONTEXT_TOOL];
-  } else if (mode === 'setup') {
-    systemPrompt = buildSetupSystemPrompt();
-    tools = [SAVE_ONBOARDING_TOOL];
   } else {
     return { error: `Unknown chat mode: ${mode}` };
   }
@@ -1393,7 +2318,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
     return { error: friendlyLlmErrorMessage(e), networkError: isNetworkError(e), errorCode: e && e.code };
   }
 
-  await applyHostedBalance(access, llmResponse);
+  let balanceCredits = await applyHostedBalance(access, llmResponse);
 
   let grantedSession = null;
   let contextUpdated = null;
@@ -1428,6 +2353,33 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         // what was requested.
         const requested = Math.round(Number(input.minutes) || 0);
 
+        // Did the coach ask for one page rather than the whole site, and is
+        // there a page here to give?
+        //
+        // Anything other than the literal 'page' — absent, misspelled, a model
+        // that has never heard of the field — reads as a site pass, which is
+        // exactly what every grant meant before this existed.
+        //
+        // The page itself is resolved HERE, from what Intention recorded, and
+        // never from anything the model said. The model is not given a URL
+        // field for the reason renderScopeBlock states: its only source for a
+        // page identity would be the <untrusted_page_data> block, which the
+        // page controls.
+        //
+        // pageScopeFor is never called for an app target. On Android and iOS
+        // there is no address to scope to — the accessibility service and the
+        // Screen Time shield both work at the whole-app level — so the coach
+        // is told scoped passes are unavailable there and a `scope: 'page'` it
+        // asks for anyway downgrades with the correction below.
+        const wantsPage = input.scope === 'page';
+        const scope = (wantsPage && !isAppTarget && pageCtx && typeof pageCtx.url === 'string')
+          ? pageScopeFor(pageCtx.url, pageCtx)
+          : null;
+        if (wantsPage && !scope) {
+          systemNote = 'There was no single page to pin that to, so your pass covers the whole site for the full time.';
+          correction = 'Your grant_access call asked for scope "page", but Intention could not identify a single page to scope it to — the destination is a feed, an app, or its address was not recorded. The pass was granted for the WHOLE SITE instead. Tell the user that, honestly and in your own words.';
+        }
+
         // Both caps are now absolute. Until the quick check was retired, a
         // model-attested "quick check" ran ahead of this check and was granted
         // straight past the grants cap on its own budget — so this is the one
@@ -1458,8 +2410,15 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         // Between the per-pass ceiling and the daily cap, because it is the
         // same kind of rule as the first and must still lose to the second:
         // the cap is a hard stop on the day, this only shortens one pass.
-        if (phase && phase.strict && minutes > STRICT_PHASE_MAX_MINUTES) {
-          minutes = STRICT_PHASE_MAX_MINUTES;
+        // A scoped pass gets the higher strict-phase ceiling, because leaving
+        // the page ends it and only the minutes actually used are banked — see
+        // STRICT_PHASE_MAX_MINUTES_SCOPED. Still below both the 60-minute
+        // ceiling applied above and the daily-remainder clamp applied below,
+        // so neither the day's total nor any single pass can grow past what
+        // the user set.
+        const strictCap = scope ? STRICT_PHASE_MAX_MINUTES_SCOPED : STRICT_PHASE_MAX_MINUTES;
+        if (phase && phase.strict && minutes > strictCap) {
+          minutes = strictCap;
           clampCause = STRICT_PHASE_CLAMP_CAUSE;
         }
         if (limits.maxMinutes > 0) {
@@ -1477,11 +2436,15 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         }
 
         if (minutes < requested) {
+          // Overwrites the downgrade correction above where both apply: the
+          // clamped-minutes one is the more surprising of the two, and a
+          // single correction turn is the whole budget. The systemNote below
+          // is likewise replaced — one line, the most load-bearing fact.
           correction = `You asked for ${requested} minutes, but only ${minutes} were available under ${clampCause}. The pass was granted for ${minutes} minutes.`;
           systemNote = clampCause === "the user's daily minutes cap"
             ? `Only ${minutes} minutes were available under your daily cap — your pass is ${minutes} minutes.`
             : clampCause === STRICT_PHASE_CLAMP_CAUSE
-              ? `Your lenient window here is spent for today, so passes are capped at ${STRICT_PHASE_MAX_MINUTES} minutes — your pass is ${minutes} minutes.`
+              ? `Your lenient window here is spent for today, so passes are capped at ${strictCap} minutes — your pass is ${minutes} minutes.`
               : `Passes top out at 60 minutes — your pass is ${minutes} minutes.`;
         }
 
@@ -1490,7 +2453,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         // feeds stats.grantsToday and reasonsToday, so an inlined version that
         // skips it silently disables both the daily cap checked above and the
         // escalating skepticism the check-in prompt is built on.
-        grantedSession = await grantSession({ sessionKey, tabId, domain, isApp, minutes, reason });
+        grantedSession = await grantSession({ sessionKey, tabId, domain, isApp, minutes, reason, scope });
       } else if (tc.name === 'note_observation' && (mode === 'gate' || mode === 'checkin')) {
         // The coach's cross-day memory. Capped, deduplicated, and readable in
         // settings — a bounded notepad, not a dossier.
@@ -1508,34 +2471,6 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
           await setStorage({ userContext: newContext });
           contextUpdated = { new_context: newContext, diff_summary: String(input.diff_summary || '').slice(0, 240) };
         }
-      } else if (tc.name === 'save_onboarding' && mode === 'setup') {
-        const userContext = String(input.user_context || '').slice(0, 5000).trim();
-        const blockedDomains = (input.blocked_domains || []).map(d =>
-          String(d).trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
-        ).filter(Boolean);
-
-        const domainLimits = {};
-        for (const item of input.domain_limits || []) {
-          if (item?.domain) {
-            const dom = String(item.domain).trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
-            domainLimits[dom] = {
-              maxGrants: Number(item.max_grants_per_day) || 3,
-              // `Number(undefined) ?? -1` was NaN — Number() never yields the
-              // nullish value ?? tests for — so an omitted per-day cap stored
-              // NaN instead of the -1 "unlimited" sentinel.
-              maxMinutes: Number.isFinite(Number(item.max_minutes_per_day)) ? Number(item.max_minutes_per_day) : -1
-            };
-          }
-        }
-
-        await setStorage({
-          userContext,
-          blockedDomains,
-          domainLimits,
-          setupComplete: true
-        });
-        await syncBlockingRules();
-        contextUpdated = { onboardingComplete: true };
       }
     } catch (e) {
       console.warn(`Intention: tool call "${tc.name}" failed`, e);
@@ -1558,13 +2493,32 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
     if (grantedSession) {
       const mins = grantedSession.intervalMinutes;
       const r = grantedSession.reason ? ` for "${grantedSession.reason}"` : '';
-      acceptanceFallback = `Okay — you've got ${mins} minute${mins === 1 ? '' : 's'}${r}. Make it count; I'll check in when the time's up.`;
+      // A scoped pass has to say what it is scoped TO, or the badge's "this
+      // page only" and the re-gate that follows read as the tool going wrong
+      // rather than as the thing they just agreed to.
+      acceptanceFallback = grantedSession.scope
+        ? `Okay — you've got ${mins} minute${mins === 1 ? '' : 's'} on that page${r}. Leave it and the block comes straight back, and you keep the minutes you don't use.`
+        : `Okay — you've got ${mins} minute${mins === 1 ? '' : 's'}${r}. Make it count; I'll check in when the time's up.`;
     } else if (settingApproved) {
       if (changeType === 'remove' || changeType === 'remove_app') acceptanceFallback = `Alright, I'm convinced — I've removed ${displayName} from your blocklist.`;
       else if (changeType === 'increase_limit' || changeType === 'increase_app_limit') acceptanceFallback = `Okay, you've made your case — I've raised your absolute max on ${displayName}.`;
       else if (changeType === 'increase_loose_window' || changeType === 'increase_app_loose_window') acceptanceFallback = `Alright — I've lengthened the easy stretch on ${displayName}. I'll still ask what you're there for.`;
       else if (changeType === 'edit_site_purpose' || changeType === 'edit_site_legitimate') acceptanceFallback = `Okay, that's a fair correction — I've saved your new wording for ${displayName}.`;
+      // Named rather than left to the generic line below, because "I've made
+      // that change" after a conversation about which SECTIONS stay blocked
+      // tells the user nothing about what is now open to them.
+      else if (changeType === 'narrow_block_scope' || changeType === 'narrow_app_block_scope') acceptanceFallback = `Alright — I've changed which parts of ${displayName} are blocked. The rest is yours.`;
       else if (changeType === 'disable_all') acceptanceFallback = `Understood — I've turned off blocking for now. Be intentional with it.`;
+      // Two shapes, because approving a removal with a cool-off set does not
+      // remove anything — and a farewell line under a screen that still says
+      // "22 hours to go" would read as the button having failed.
+      else if (changeType === 'uninstall') {
+        const delay = formatLeaveDelay(settingApproved.delayMinutes);
+        acceptanceFallback = delay
+          ? `Understood. Your ${delay} starts now — come back when it's up and it'll be one tap. I won't get in your way again before then.`
+          : `Understood. I've stepped out of the way — go ahead and remove it. Look after yourself.`;
+      }
+      else if (changeType === 'decrease_leave_delay') acceptanceFallback = `Alright — I've shortened the wait on removing Intention.`;
       else acceptanceFallback = `Okay, I'm convinced — I've made that change.`;
     }
   }
@@ -1591,7 +2545,10 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         messages: history,
         tools: []
       });
-      await applyHostedBalance(access, second);
+      // The correction turn spends credit too, so its answer supersedes the
+      // first one's — reporting the pre-correction balance would tell the user
+      // a number that was already out of date when it was printed.
+      balanceCredits = await applyHostedBalance(access, second);
       // Tool calls from the correction turn are ignored wholesale: the state
       // has already been settled above, and honouring a fresh grant here
       // would reopen the loop this turn exists to close.
@@ -1629,7 +2586,12 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
     grantedSession,
     contextUpdated,
     approved: settingApproved ? true : false,
-    systemNote: systemNote || undefined
+    systemNote: systemNote || undefined,
+    // Ride-along, so the gate can keep a credit line honest without a second
+    // round trip after every message. Same two exclusions as getAccess: zero
+    // is locked rather than low, and a route with no balance says nothing.
+    balanceCredits: balanceCredits === null ? undefined : balanceCredits,
+    lowCredit: balanceCredits !== null && balanceCredits > 0 && balanceCredits <= LOW_CREDIT_CREDITS
   };
 }
 
@@ -1647,6 +2609,97 @@ function friendlyLlmErrorMessage(e) {
       return "The request timed out. Try again.";
     default:
       return (e && e.message) || 'Something went wrong talking to the AI provider.';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Leaving: the state the options page reads, and the two verbs it can send.
+// ---------------------------------------------------------------------------
+
+// A stored leaveRequest, or null. Everything downstream — the settings card,
+// the interposition guard — treats "no request" and "a request we cannot read"
+// identically, and the direction of that failure is chosen: an unreadable
+// request means Intention thinks nobody has asked to leave, which costs the
+// user one more conversation. Reading it the other way would mean a corrupt
+// value silently held the door open forever.
+function normalizeLeaveRequest(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const availableAt = Number(raw.availableAt);
+  if (!Number.isFinite(availableAt) || availableAt <= 0) return null;
+  return {
+    requestedAt: Number(raw.requestedAt) || 0,
+    availableAt,
+    delayMinutes: normalizeLeaveDelay(raw.delayMinutes)
+  };
+}
+
+// The four ways the leaving conversation can end. Stored so that the reason a
+// stand-down exists is legible later — and because 'declined' has to look
+// exactly like 'approved' to the interposition guard, which is the whole
+// anti-loop property and is easier to believe when you can see the value.
+const LEAVE_OUTCOMES = ['approved', 'declined', 'cancelled', 'anyway'];
+
+// Whether this build can remove itself.
+//
+// False on Apple builds, and not because the API is missing — it is there, and
+// calling it would work. It would remove the SAFARI EXTENSION while leaving
+// the Intention app sitting in /Applications or on the home screen, which is
+// not what "Remove Intention" says and not what anyone pressing it wants. The
+// options page shows instructions instead (see IS_APPLE_BUILD in options.js).
+// False on Android too, where the background WebView's chrome shim has no
+// management namespace and removal is an OS-level uninstall.
+function canSelfUninstall() {
+  if (IS_APPLE_BUILD) return false;
+  return typeof chrome !== 'undefined' && !!(chrome.management && chrome.management.uninstallSelf);
+}
+
+async function getLeaveState() {
+  const stored = await getStorage(['leaveDelayMinutes', 'leaveRequest', 'leaveStandDown']);
+  const now = Date.now();
+  const request = normalizeLeaveRequest(stored.leaveRequest);
+  const standDownUntil = Number(stored.leaveStandDown && stored.leaveStandDown.until) || 0;
+  return {
+    leaveDelayMinutes: normalizeLeaveDelay(stored.leaveDelayMinutes),
+    leaveRequest: request,
+    // Computed here rather than in the page, so the clock that decides a
+    // cool-off has elapsed is the same one that wrote it.
+    ready: !!request && now >= request.availableAt,
+    standDownUntil: standDownUntil > now ? standDownUntil : 0,
+    canSelfUninstall: canSelfUninstall()
+  };
+}
+
+// Record that the leaving conversation reached an end. Called for every one of
+// them, including the ones where the user decided to stay — see
+// LEAVE_STAND_DOWN_MS.
+async function beginLeave(reason) {
+  const until = Date.now() + LEAVE_STAND_DOWN_MS;
+  const outcome = LEAVE_OUTCOMES.includes(reason) ? reason : 'declined';
+  await setStorage({ leaveStandDown: { until, reason: outcome } });
+  return { ok: true, standDownUntil: until, reason: outcome };
+}
+
+// The exit. Reached from the always-available "Remove it anyway" button and
+// from a coach approval with no cool-off set; both are the same act.
+//
+// The stand-down is written FIRST, before the uninstall is attempted, and that
+// ordering is the point: if the user cancels the browser's own confirmation
+// dialog, Intention is still running and must not greet them with the same
+// conversation the moment they look at the extensions page again.
+async function completeRemoval() {
+  await beginLeave('anyway');
+  if (!canSelfUninstall()) return { ok: false, reason: 'unsupported' };
+  try {
+    // The documented options bag. Without it Chrome removes the extension with
+    // no prompt at all, and one mis-tap on a phone-sized settings page should
+    // not be able to end this silently — the friction here is the browser's
+    // own dialog, which is exactly the right amount.
+    await chrome.management.uninstallSelf({ showConfirmDialog: true });
+    return { ok: true };
+  } catch (e) {
+    // The overwhelmingly likely case is that the user said no to that dialog,
+    // which is not an error and must not be reported as one.
+    return { ok: false, reason: 'cancelled', error: String((e && e.message) || e) };
   }
 }
 
@@ -1739,6 +2792,43 @@ async function applySettingChange({ domain, changeType, newValue }) {
     return { changeType, domain, serviceReasons: next };
   }
 
+  // Narrowing what is blocked on a target to particular sections of it. The
+  // value is a whole rule ({ scope, parts }), not a number, and it is the only
+  // change type where the direction of the edit is not implied by its name:
+  // ADDING a part to an 'only' list blocks MORE and never reaches here, while
+  // adding one to an 'except' list blocks less and does. The options page runs
+  // that test (partEditIsLoosening) before it decides whether to ask at all;
+  // this end only ever applies what was approved.
+  //
+  // Everything goes through sanitizePartRule, so a hostile or malformed
+  // newValue — a value the coach was talked into approving, a list of 500 ids,
+  // an id containing a regex — lands as the clean rule or as no rule at all.
+  // When it resolves to no rule, BOTH keys are deleted rather than written as
+  // 'all': an entry with no part rule has to stay byte-identical to what
+  // shipped before this feature, which is what makes the migration empty.
+  if (changeType === 'narrow_block_scope' || changeType === 'narrow_app_block_scope') {
+    const isApp = changeType === 'narrow_app_block_scope';
+    const key = isApp ? 'appLimits' : 'domainLimits';
+    const limits = { ...(isApp ? appLimits : domainLimits) };
+    if (!limits[domain]) limits[domain] = { maxGrants: 3 };
+    const next = sanitizePartRule(newValue);
+    const entry = { ...limits[domain] };
+    if (hasPartRule(next)) {
+      entry.scope = next.scope;
+      entry.parts = next.parts;
+    } else {
+      delete entry.scope;
+      delete entry.parts;
+    }
+    limits[domain] = entry;
+    await setStorage({ [key]: limits });
+    // Only the site half: which domains carry a redirect rule depends on
+    // whether they have a part rule (see domainsNeedingRedirect). An app
+    // target has no DNR rule to re-sync.
+    if (!isApp) await syncBlockingRules();
+    return { changeType, domain, [key]: limits, scope: next.scope, parts: next.parts };
+  }
+
   // `increase_quick_check` / `increase_app_quick_check` used to be handled
   // here. The quick check is retired, nothing can request either change type
   // any more, and an unrecognised changeType falls through to the null below
@@ -1750,6 +2840,69 @@ async function applySettingChange({ domain, changeType, newValue }) {
     return { changeType, blockedDomains: [], blockedApps: [] };
   }
 
+  // The coach has agreed to the user leaving. Note what this branch does NOT
+  // do: it does not remove anything, clear anything, or touch a single
+  // blocking rule. Removal is an act the user performs afterwards, through
+  // their browser's own dialog (completeRemoval above) or through the OS. All
+  // that happens here is that Intention stops standing in the way.
+  //
+  // Two shapes, decided by the cool-off the user set for themselves:
+  //
+  //   no delay — the way is clear now. A stand-down is written so the
+  //              conversation does not reopen while they are on their way to
+  //              the extensions page to finish.
+  //   a delay  — the clock starts. Intention keeps working, unchanged, for
+  //              the whole of it. Nothing about the blocklist moves; the only
+  //              thing that changes is that a request now exists, and when it
+  //              matures the settings card offers a one-tap removal.
+  //
+  // A stand-down is written on BOTH paths. The design this came from wrote one
+  // only on the no-delay path; writing it on both makes "every outcome of the
+  // leaving conversation writes a stand-down" a rule with no exceptions, which
+  // is a far easier thing to state — to a store reviewer, and to the next
+  // person reading this — than one with a carve-out. A live leaveRequest
+  // suppresses interposition for its whole life anyway (leaveInterposeAllowed),
+  // so the stand-down is belt to that braces and can only ever add silence.
+  if (changeType === 'uninstall') {
+    const { leaveDelayMinutes } = await getStorage(['leaveDelayMinutes']);
+    const delayMinutes = normalizeLeaveDelay(leaveDelayMinutes);
+    const now = Date.now();
+    const standDownUntil = now + LEAVE_STAND_DOWN_MS;
+    if (delayMinutes <= 0) {
+      await setStorage({
+        leaveStandDown: { until: standDownUntil, reason: 'approved' },
+        leaveRequest: null
+      });
+      return { changeType, delayMinutes: 0, removalReady: true, standDownUntil };
+    }
+    const availableAt = now + delayMinutes * 60000;
+    await setStorage({
+      leaveRequest: { requestedAt: now, availableAt, delayMinutes },
+      leaveStandDown: { until: standDownUntil, reason: 'approved' }
+    });
+    return { changeType, delayMinutes, removalReady: false, availableAt, standDownUntil };
+  }
+
+  // Shortening the cool-off. The mirror of every other change type in here:
+  // LENGTHENING it is a tightening and saves for free through saveSettings,
+  // and only the loosening half ever costs a conversation.
+  //
+  // The `>=` refusal is not defensive coding, it is the rule. A "decrease"
+  // that raised the number would let a user launder a change through the gate
+  // that they could have made for free — and, far worse, a value equal to the
+  // current one would let the coach be talked into approving a no-op, which
+  // reads to the user as their cool-off having been shortened when nothing
+  // moved. Returning null puts it in the same class as an unrecognised change
+  // type, which every caller already treats as "not approved".
+  if (changeType === 'decrease_leave_delay') {
+    const { leaveDelayMinutes } = await getStorage(['leaveDelayMinutes']);
+    const current = normalizeLeaveDelay(leaveDelayMinutes);
+    const next = normalizeLeaveDelay(newValue);
+    if (next >= current) return null;
+    await setStorage({ leaveDelayMinutes: next });
+    return { changeType, leaveDelayMinutes: next, previousLeaveDelayMinutes: current };
+  }
+
   return null;
 }
 
@@ -1759,8 +2912,8 @@ async function applySettingChange({ domain, changeType, newValue }) {
 // recordGrant still accepts a { quickCheck } option and tracking.js still
 // keeps that tally — see the note there. Nothing passes it any more: every
 // grant is a normal grant now, so every grant counts against the daily cap.
-async function grantSession({ sessionKey, tabId, domain, isApp, minutes, reason }) {
-  await recordGrant(domain, minutes, reason);
+async function grantSession({ sessionKey, tabId, domain, isApp, minutes, reason, scope }) {
+  await recordGrant(domain, minutes, reason, scope ? { scope: 'page' } : undefined);
 
   // Granting replaces whatever session held this key (a check-in extending
   // time, or a native port reusing the target's slot), so bank the old
@@ -1773,12 +2926,21 @@ async function grantSession({ sessionKey, tabId, domain, isApp, minutes, reason 
   }
 
   const session = { domain, reason, intervalMinutes: minutes, startTime: Date.now() };
+  // Written ONLY when there is one. Absence is the third state and it is the
+  // entire migration story: every session already in storage, every site pass
+  // granted after this, and every simpleGrant carry no `scope` key and are
+  // read as site-wide by everything that looks at them — including the three
+  // native readers of this value (IntentionAccessibilityService's
+  // latestSessionExpiry, SessionOverlay.liveSession, iOS
+  // PassLiveActivityController), none of which know this field exists and none
+  // of which need to. Never write { kind: 'site' }.
+  if (scope) session.scope = scope;
   await mutateStorage('activeSessions', (sessions) => { sessions[sessionKey] = session; });
   chrome.alarms.create(`checkin-${sessionKey}`, { delayInMinutes: minutes });
   // Apps have no network rules to allow — the Android accessibility
   // service reads activeSessions directly to let the app through — and
   // neither do the native ports, which have no tab to scope a rule to.
-  if (!isApp && tabId != null) await registerSessionRule(tabId, domain);
+  if (!isApp && tabId != null) await registerSessionRule(tabId, session);
   // Drops this domain's redirect rule for the life of the pass.
   if (!isApp) await syncBlockingRules();
   return session;
@@ -1860,7 +3022,11 @@ async function settleTabRule(tabId) {
     .map(key => activeSession(activeSessions[key]))
     .find(Boolean);
   if (stillLive) {
-    await registerSessionRule(tabId, stillLive.domain);
+    // The surviving session's own rule, not just its domain: if what is left
+    // on this tab is a page-scoped pass, the rule that replaces the one being
+    // torn down has to be the narrow one, or ending an unrelated pass would
+    // quietly widen a scoped one to the whole site.
+    await registerSessionRule(tabId, stillLive);
   } else {
     removeSessionRule(tabId);
   }
@@ -1884,11 +3050,23 @@ async function endSession({ tabId, domain, reason }) {
     }
   }
 
-  await retireSessionKey(sessionKey, 'ended');
+  // 'left_page' is its own outcome rather than an early close: the pass ended
+  // because the page it was pinned to is no longer the page they are on. The
+  // minutes banked are the same ones they actually used, and the track record
+  // gets to say "you asked for that one video and closed it" instead of
+  // flattening it into another closed_early.
+  await retireSessionKey(sessionKey, reason === 'left_page' ? 'left_page' : 'ended');
   await settleTabRule(tabId);
-  // The pass is over: this domain needs its redirect rule back.
+  // The pass is over: this domain needs its redirect rule back. (For a scoped
+  // pass on an engine where allowOutranksRedirect() holds, it never went away
+  // — see domainsNeedingRedirect — so this is the no-op the idempotence check
+  // in applyBlockingRules exists for. Where it does not hold, a scoped pass
+  // dropped the redirect like any other and this is what restores it.)
   await syncBlockingRules();
 
+  // Deliberately not for 'left_page': they are still on a page of this site,
+  // and the drift screen that sent this is about to put the gate up in front
+  // of them. Closing the tab from under it would look like a crash.
   if (reason === 'fulfilled' && tabId != null) {
     try { chrome.tabs.remove(tabId); } catch (e) {}
   }

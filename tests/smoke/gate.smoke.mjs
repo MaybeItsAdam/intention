@@ -42,6 +42,12 @@ const OBS_REPLY = 'Noted. Sounds like evenings are the pattern here — what is 
 const OBSERVATION = 'They tend to drift to example.com in the evenings.';
 const PROBE_REPLY = 'A quick check of what, exactly?';
 const GRANT_REPLY = 'Take five minutes for that and come straight back.';
+const SCOPED_REPLY = 'That one page, twelve minutes, and the block comes back when you leave it.';
+
+// The last path segment carries a dash so page_context.js derives a title from
+// the slug ("Scoped Page One"), which is what the badge and the scope block
+// both quote back.
+const FIXTURE_ONE_PATH = '/scoped-page-one';
 
 const results = [];
 const record = (name, pass, detail = '') => {
@@ -77,6 +83,34 @@ function startBackendStub() {
     });
     server.listen(0, '127.0.0.1', () => {
       resolveServer({ server, stub, received, port: server.address().port });
+    });
+  });
+}
+
+// A two-page site on a host we can actually block. The scoped-pass assertions
+// need a real second page on the same origin AND a record of what was
+// requested over the wire, because "the drift screen appeared without a
+// network navigation" is half of what a page-scoped pass claims to do.
+//
+// Both paths carry a dashed last segment, so page_context.js derives a title
+// from the slug without a metadata fetch: the labels below are then fixed
+// strings the assertions can name, rather than whatever an HTML round trip
+// happened to return.
+const FIXTURE_ONE = FIXTURE_ONE_PATH;
+const FIXTURE_TWO = '/scoped-page-two';
+
+function startFixtureServer() {
+  const requests = [];
+  return new Promise((resolveServer) => {
+    const server = createServer((req, res) => {
+      const path = (req.url || '').split('?')[0];
+      requests.push(path);
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>Fixture ${path}</title></head>` +
+        `<body><h1>${path}</h1><p>Local fixture page.</p></body></html>`);
+    });
+    server.listen(0, '127.0.0.1', () => {
+      resolveServer({ server, requests, port: server.address().port });
     });
   });
 }
@@ -121,6 +155,11 @@ async function watchRendered(page, expected, timeoutMs = 5000) {
 
 async function main() {
   const { server, stub, received, port } = await startBackendStub();
+  const fixture = await startFixtureServer();
+  // Reached as `localhost` rather than `127.0.0.1`: the blocklist keys on a
+  // hostname, and the backend stub is addressed by IP, so the two never
+  // collide and blocking one cannot take the coach offline.
+  const fixtureOrigin = `http://localhost:${fixture.port}`;
   const profile = await mkdtemp(join(tmpdir(), 'intention-smoke-'));
 
   const context = await chromium.launchPersistentContext(profile, {
@@ -394,6 +433,344 @@ async function main() {
     record('exactly the four expected backend requests were made',
       received.length === 4, `${received.length} request(s)`);
 
+    // ── Page-scoped passes ────────────────────────────────────────────────
+    //
+    // A pass for ONE page rather than the whole site. Everything about it is
+    // only true if two things hold at once: the domain's redirect rule stays
+    // in place (so every other page still gates), and the content script
+    // notices an in-page navigation that makes no network request at all (so
+    // an autoplay into the next video ends the pass). Neither can be checked
+    // anywhere but here — the vm suite has no rule store and no navigation.
+    await settings.evaluate(async () => {
+      await new Promise((done) => {
+        chrome.runtime.sendMessage(
+          { action: 'saveSettings', config: { blockedDomains: ['example.com', 'localhost'] } },
+          () => done()
+        );
+      });
+    });
+
+    let scopedRules = [];
+    for (let attempt = 0; attempt < 20 && !scopedRules.includes('||localhost^'); attempt++) {
+      await settings.waitForTimeout(250);
+      scopedRules = await worker.evaluate(async () => {
+        const dynamic = await chrome.declarativeNetRequest.getDynamicRules();
+        return dynamic.map(r => r.condition?.urlFilter);
+      });
+    }
+    record('the local fixture host is blocked like any other site',
+      scopedRules.includes('||localhost^'), `rules: ${JSON.stringify(scopedRules)}`);
+
+    // One exchange, which is what the scope guidance tells the coach a named
+    // destination deserves.
+    stub.replyFor = (i) => (i >= 4 ? {
+      text: SCOPED_REPLY,
+      toolCalls: [{
+        id: 'toolu_scope_1',
+        name: 'grant_access',
+        input: { minutes: 12, reason: 'someone sent me this', scope: 'page' }
+      }],
+      balanceCredits: 96
+    } : null);
+
+    const scopedPage = await context.newPage();
+    // A query string on the granted address, deliberately: the narrowed allow
+    // rule is built from it, and whether the rule store accepts a urlFilter
+    // carrying one is the thing this run has to settle.
+    const grantedUrl = `${fixtureOrigin}${FIXTURE_ONE}?v=one`;
+    await scopedPage.goto(grantedUrl, { waitUntil: 'domcontentloaded' });
+    await waitFor(() => scopedPage.url().startsWith(gateUrlPrefix), 4000);
+    record('the fixture page opens the coach',
+      scopedPage.url().startsWith(gateUrlPrefix), `url: ${scopedPage.url()}`);
+
+    const scopedOpened = await waitFor(() => received.length >= 5, 15000, 25);
+    record('the scoped gate opens a conversation', Boolean(scopedOpened),
+      `${received.length} request(s)`);
+
+    const scopedSystem = joinSystem(received[4]?.body.system);
+    record('the prompt offers the coach a page-scoped pass',
+      scopedSystem.includes('grant_access with scope "page"'),
+      scopedSystem.split('\n').find(l => l.includes('scope "page"')) || '(absent)');
+
+    // Below the cache break and after the closing fence: inside the fence, the
+    // page could pass its own text off as part of the rules about how easily
+    // to let it through.
+    record('the scope block lands after the untrusted page data fence',
+      scopedSystem.lastIndexOf('</untrusted_page_data>') > -1 &&
+      scopedSystem.indexOf('Scoped passes (these are facts') > scopedSystem.lastIndexOf('</untrusted_page_data>'));
+
+    record('the grant tool carries the scope enum and does not require it',
+      (received[4]?.body.tools || []).some(t => t.name === 'grant_access' &&
+        JSON.stringify(t.schema?.properties?.scope?.enum) === '["page","site"]' &&
+        !(t.schema?.required || []).includes('scope')));
+
+    const backOnFixture = await scopedPage.waitForURL(
+      u => u.href.startsWith(fixtureOrigin), { timeout: 6000, waitUntil: 'commit' }
+    ).then(() => true).catch(() => false);
+    record('a scoped grant lands on the exact page it was granted for',
+      backOnFixture && scopedPage.url() === grantedUrl, `url: ${scopedPage.url()}`);
+
+    // The badge has to say what the pass is FOR. "The block came back" a
+    // minute later only reads as intended behaviour if this line was there.
+    const badgeText = await waitFor(
+      () => scopedPage.locator('#intention-badge').textContent().catch(() => null),
+      6000, 100
+    );
+    record('the badge says the pass is for this page only',
+      Boolean(badgeText) && /this page only/i.test(badgeText), `badge: ${badgeText}`);
+    record('the badge names the page the pass was granted for',
+      Boolean(badgeText) && /Scoped page one/i.test(badgeText), `badge: ${badgeText}`);
+
+    // The rule above only survives on an engine background.js is willing to
+    // trust with the ordering "priority-2 allow beats priority-1 redirect" —
+    // and this is the browser where that ordering is actually exercised, so the
+    // answer here has to be yes. It is asserted separately from the rule
+    // itself because the first version of the detector ("Chromium is the
+    // runtime with no `browser` namespace") was wrong — Chrome exposes
+    // `browser` as an alias of `chrome` — and it reported THIS browser as
+    // unverified, silently degrading every scoped pass to a site pass. Only
+    // the check below can tell that apart from a rule that failed to register.
+    const engineTrusted = await worker.evaluate(() => ({
+      trusted: allowOutranksRedirect(),
+      hasBrowserNamespace: typeof browser !== 'undefined'
+    }));
+    record('the engine this suite runs on is one the redirect logic trusts',
+      engineTrusted.trusted === true, JSON.stringify(engineTrusted));
+
+    // THE assertion. A scoped pass that dropped this rule would silently open
+    // the whole site while the badge above said otherwise.
+    const rulesDuringPass = await worker.evaluate(async () => {
+      const dynamic = await chrome.declarativeNetRequest.getDynamicRules();
+      return dynamic.map(r => `${r.condition?.urlFilter} ${r.action?.type}`);
+    });
+    record('the domain redirect rule is STILL registered during a scoped pass',
+      rulesDuringPass.includes('||localhost^ redirect'),
+      `dynamic rules: ${JSON.stringify(rulesDuringPass)}`);
+
+    // The other half of the same mechanism: the per-tab allow rule has to be
+    // narrowed to the granted address, or it would let the whole domain past
+    // the redirect rule above.
+    const sessionRules = await worker.evaluate(async () => {
+      const rules = await chrome.declarativeNetRequest.getSessionRules();
+      return rules.map(r => ({ filter: r.condition?.urlFilter, type: r.action?.type }));
+    });
+    const narrowed = sessionRules.find(r => r.type === 'allow' && r.filter && r.filter.includes(FIXTURE_ONE_PATH));
+    record('the session allow rule was narrowed to the granted page',
+      Boolean(narrowed), `session rules: ${JSON.stringify(sessionRules)}`);
+    // If this one fails, dnrUrlFilterFor must return '' for query-bearing
+    // URLs and enforcement falls back to the content script alone — which is
+    // already how Safari enforces every pass, but it should be known.
+    record('the rule store accepted a urlFilter carrying a query string',
+      Boolean(narrowed && narrowed.filter.includes('?v=one')),
+      `narrowed filter: ${narrowed ? narrowed.filter : '(none)'}`);
+
+    // The navigation nobody sees: pushState makes no request, commits nothing
+    // and re-injects no content script. It is exactly what a YouTube autoplay
+    // into the next video is, and catching it is the whole point.
+    // Favicon requests are the browser's, not the navigation's, so they are
+    // not what "no network navigation" is about.
+    const pageRequests = () => fixture.requests.filter(r => r !== '/favicon.ico');
+    const requestsBefore = pageRequests().length;
+    await scopedPage.evaluate((next) => {
+      history.pushState({}, '', next);
+    }, `${FIXTURE_TWO}?v=two`);
+
+    const driftSeen = await scopedPage.locator('#intention-root')
+      .filter({ hasText: 'That pass was for one page' })
+      .waitFor({ state: 'visible', timeout: 2500 })
+      .then(() => true).catch(() => false);
+    record('an in-page navigation off the granted page shows the drift screen',
+      driftSeen, `url: ${scopedPage.url()}`);
+
+    record('and it did so with no network navigation at all',
+      pageRequests().length === requestsBefore &&
+      !fixture.requests.includes(FIXTURE_TWO),
+      `fixture requests: ${JSON.stringify(fixture.requests)}`);
+
+    record('the drift screen is not a second coach conversation',
+      received.length === 5, `${received.length} request(s)`);
+
+    // ── Part rules: only some of a site is blocked ────────────────────────
+    //
+    // Two things can only be checked here. First, a host carrying a part rule
+    // has to LEAVE the blanket redirect list — a `||host^` urlFilter cannot
+    // see a path, so it would redirect the sections the user explicitly left
+    // open. Second, once it has left, the gate backstop is the thing most
+    // likely to undo the feature: an allowed page never reports an overlay,
+    // because there is nothing to report, and a backstop that read that as a
+    // failure would navigate every allowed page to the coach three seconds in.
+    // Only a real browser waits three real seconds.
+    stub.replyFor = null;
+    await settings.evaluate(async () => {
+      // The scoped pass from the section above is still live and would show a
+      // badge instead of a gate on the pages below.
+      //
+      // The rule itself is seeded straight into storage — the state a coach
+      // conversation would have left behind — and only then saved through
+      // saveSettings. saveSettings will not WIDEN a part rule (see
+      // holdPartRuleDirection in background.js: carving a section out of a
+      // fully blocked host leaves less of it blocked, and every loosening goes
+      // through the coach), so a test that arrived here by sending the new rule
+      // cold would be testing the guard rather than the redirect. Saving it a
+      // second time is what this section is actually about: the write has to
+      // re-sync the rules.
+      const rule = { localhost: { maxGrants: 3, maxMinutes: 45, scope: 'only', parts: ['path:/blocked/*'] } };
+      await chrome.storage.local.set({ activeSessions: {}, domainLimits: rule });
+      await new Promise((done) => {
+        chrome.runtime.sendMessage({
+          action: 'saveSettings',
+          config: { blockedDomains: ['example.com', 'localhost'], domainLimits: rule }
+        }, () => done());
+      });
+    });
+
+    const rulesFor = async () => worker.evaluate(async () => {
+      const dynamic = await chrome.declarativeNetRequest.getDynamicRules();
+      return dynamic.map(r => `${r.condition?.urlFilter} ${r.action?.type} p${r.priority}`);
+    });
+
+    let partRules = [];
+    for (let attempt = 0; attempt < 20; attempt++) {
+      partRules = await rulesFor();
+      if (!partRules.some(r => r.startsWith('||localhost^'))) break;
+      await settings.waitForTimeout(250);
+    }
+    record('a host with a part rule drops out of the blanket redirect',
+      !partRules.some(r => r.startsWith('||localhost^')), `rules: ${JSON.stringify(partRules)}`);
+    record('and a host without one keeps its rule',
+      partRules.some(r => r.startsWith('||example.com^')), `rules: ${JSON.stringify(partRules)}`);
+
+    const partPage = await context.newPage();
+    await partPage.goto(`${fixtureOrigin}/allowed-page`, { waitUntil: 'domcontentloaded' });
+    // Longer than GATE_BACKSTOP_GRACE_MS (3s) on purpose: the backstop firing
+    // here is the failure this wait exists to catch.
+    await partPage.waitForTimeout(4000);
+    record('an address the rule leaves open is not gated at all',
+      partPage.url().startsWith(fixtureOrigin) &&
+      (await partPage.locator('#intention-root').count()) === 0,
+      `url: ${partPage.url()}`);
+
+    const requestsBeforeBlockedPart = fixture.requests.length;
+    await partPage.goto(`${fixtureOrigin}/blocked/one`, { waitUntil: 'domcontentloaded' });
+    const partGated = await waitFor(
+      async () => (await partPage.locator('#intention-root').count()) > 0, 6000);
+    record('the part the rule names is gated', Boolean(partGated), `url: ${partPage.url()}`);
+    // Via the overlay, not a redirect: the page itself loaded, which is what a
+    // sectioned host trades for being able to see the path at all. This is
+    // already how Safari gates every blocked site.
+    record('and it is gated by the overlay, on the page itself',
+      partPage.url().startsWith(fixtureOrigin) &&
+      fixture.requests.length > requestsBeforeBlockedPart,
+      `url: ${partPage.url()}`);
+
+    // The SPA case, which is the single test that proves the whole watcher
+    // design: no request, no commit, no re-injected content script.
+    const spaPage = await context.newPage();
+    await spaPage.goto(`${fixtureOrigin}/allowed-page`, { waitUntil: 'domcontentloaded' });
+    // The poll skips a hidden tab by design, and every page this run has left
+    // open is a tab. Foreground it the way the user would.
+    await spaPage.bringToFront();
+    await spaPage.waitForTimeout(1000);
+    const spaRequestsBefore = fixture.requests.filter(r => r !== '/favicon.ico').length;
+    await spaPage.evaluate(() => { history.pushState({}, '', '/blocked/two'); });
+    const spaGated = await waitFor(
+      async () => (await spaPage.locator('#intention-root').count()) > 0, 3000);
+    record('an in-page navigation onto a blocked part gates within a second or two',
+      Boolean(spaGated), `url: ${spaPage.url()}`);
+    record('and it did so with no network navigation at all',
+      fixture.requests.filter(r => r !== '/favicon.ico').length === spaRequestsBefore &&
+      !fixture.requests.includes('/blocked/two'),
+      `fixture requests: ${JSON.stringify(fixture.requests.slice(-4))}`);
+
+    // ── The other scope: everything except the parts named ────────────────
+    //
+    // Seeded and then saved, for the reason given at the top of this section:
+    // 'only' -> 'except' is not comparable by list membership, so parts.js
+    // answers "unprovable" and saveSettings refuses to make the change on its
+    // own. What is under test here is the verdict, not the gate.
+    await settings.evaluate(async () => {
+      const rule = { localhost: { maxGrants: 3, maxMinutes: 45, scope: 'except', parts: ['path:/allowed*'] } };
+      await chrome.storage.local.set({ activeSessions: {}, domainLimits: rule });
+      await new Promise((done) => {
+        chrome.runtime.sendMessage({
+          action: 'saveSettings',
+          config: { domainLimits: rule }
+        }, () => done());
+      });
+    });
+    await settings.waitForTimeout(500);
+
+    const exceptPage = await context.newPage();
+    await exceptPage.goto(`${fixtureOrigin}/allowed-page`, { waitUntil: 'domcontentloaded' });
+    await exceptPage.waitForTimeout(4000);
+    record('under an except rule the excepted path is not redirected and not gated',
+      exceptPage.url().startsWith(fixtureOrigin) &&
+      (await exceptPage.locator('#intention-root').count()) === 0,
+      `url: ${exceptPage.url()}`);
+
+    await exceptPage.goto(`${fixtureOrigin}/anything-else`, { waitUntil: 'domcontentloaded' });
+    const exceptGated = await waitFor(
+      async () => (await exceptPage.locator('#intention-root').count()) > 0, 6000);
+    record('and everything outside the exception is gated',
+      Boolean(exceptGated), `url: ${exceptPage.url()}`);
+
+    // ── v1.5 probe: could an `except` rule keep its redirect after all? ────
+    //
+    // v1 takes a sectioned host off the redirect entirely. v1.5 would keep the
+    // redirect and add one priority-3 `allow` rule per exception, which removes
+    // the page flash on the commonest shape ("block Reddit except r/rust") —
+    // but only if a higher-priority allow really does beat a lower-priority
+    // redirect in Chromium's matcher. That is the whole of the go/no-go, and
+    // it is answered here rather than assumed. Nothing below changes what the
+    // extension ships; the probe rules are added and removed by hand.
+    await settings.evaluate(async () => {
+      await new Promise((done) => {
+        chrome.runtime.sendMessage({
+          action: 'saveSettings',
+          config: { domainLimits: {} }
+        }, () => done());
+      });
+    });
+    let restored = [];
+    for (let attempt = 0; attempt < 20; attempt++) {
+      restored = await rulesFor();
+      if (restored.some(r => r.startsWith('||localhost^'))) break;
+      await settings.waitForTimeout(250);
+    }
+    record('removing a part rule puts the redirect back',
+      restored.some(r => r.startsWith('||localhost^')), `rules: ${JSON.stringify(restored)}`);
+
+    const probeAccepted = await worker.evaluate(async () => {
+      try {
+        await chrome.declarativeNetRequest.updateDynamicRules({
+          addRules: [{
+            id: 5001,
+            priority: 3,
+            action: { type: 'allow' },
+            condition: { urlFilter: '/allowed-page', resourceTypes: ['main_frame'] }
+          }]
+        });
+        return 'accepted';
+      } catch (e) {
+        return String((e && e.message) || e);
+      }
+    });
+    record('[v1.5 probe] the rule store accepts a priority-3 allow beside a redirect',
+      probeAccepted === 'accepted', probeAccepted);
+
+    const probePage = await context.newPage();
+    await probePage.goto(`${fixtureOrigin}/allowed-page`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    const allowBeatRedirect = probePage.url().startsWith(fixtureOrigin);
+    // The overlay may still cover the page afterwards — that is the content
+    // script doing its job. The question here is only whether the request was
+    // allowed to reach the network at all.
+    record('[v1.5 probe] a higher-priority allow beats a lower-priority redirect',
+      allowBeatRedirect, `url: ${probePage.url()}`);
+    await worker.evaluate(async () => {
+      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [5001] });
+    });
+    await probePage.close();
+
     // Being able to read the real thing beats inferring it from assertions —
     // this is the only place the actual shipped prompt can be seen.
     if (process.argv.includes('--print-prompt')) {
@@ -406,6 +783,7 @@ async function main() {
   } finally {
     await context.close();
     server.close();
+    fixture.server.close();
     await rm(profile, { recursive: true, force: true });
   }
 

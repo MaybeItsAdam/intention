@@ -7,7 +7,8 @@
 // or iOS hosts from here.
 
 import { describe, it, expect, vi } from 'vitest';
-import { loadBackground, makeMockFetch } from './load.js';
+import vm from 'node:vm';
+import { loadBackground, makeMockFetch, evaluateScripts, filesForContext } from './load.js';
 
 const CONFIGURED = { provider: 'anthropic', apiKey: 'test-key', model: 'claude-sonnet-5' };
 
@@ -249,6 +250,61 @@ describe('check-in alarm', () => {
     const stats = await ctx.getStatsForDomain('instagram.com');
     expect(stats.minutesToday).toBe(10);
     expect(stats.sessionsToday[0].outcome).toBe('ran_out');
+  });
+
+  // A DELIVERED MESSAGE IS NOT A RENDERED CHECK-IN, and treating it as one is
+  // how a pass's minutes went missing. The content script has three arms that
+  // decline to render — a conversation already owns the page, the address is
+  // one the user's own part rule leaves open, or the pass is for a different
+  // site than this tab is on — and every one of them RESOLVED
+  // chrome.tabs.sendMessage. The catch that does the banking never ran, and
+  // nothing repairs it later: reconcileSessions is only reachable through its
+  // own message, which only the native hosts send.
+  describe('when the tab answers but shows nothing', () => {
+    async function withPassOnTab(reply) {
+      const { ctx, chrome, listeners } = loadBackground({ seed: CONFIGURED, fetch: grantingFetch(10) });
+      await ctx.handleMessage(
+        { action: 'chat', mode: 'gate', domain: 'instagram.com', userMessage: 'a' },
+        tab(42)
+      );
+      chrome.storage._store.activeSessions['tab:42:instagram.com'].startTime = Date.now() - 10 * 60000;
+      const sent = [];
+      chrome.tabs.sendMessage = (id, message) => { sent.push({ id, message }); return Promise.resolve(reply); };
+      await listeners.alarm({ name: 'checkin-tab:42:instagram.com' });
+      return { ctx, chrome, sent };
+    }
+
+    it('banks the pass when the page says it showed nothing', async () => {
+      const { ctx, chrome } = await withPassOnTab({ shown: false });
+      expect(chrome.storage._store.activeSessions['tab:42:instagram.com']).toBeUndefined();
+      const stats = await ctx.getStatsForDomain('instagram.com');
+      expect(stats.minutesToday).toBe(10);
+      expect(stats.sessionsToday[0].outcome).toBe('ran_out');
+    });
+
+    // Anything that is not an explicit yes is a no: an older content script
+    // answers nothing at all, and its pass must not be stranded either.
+    it('banks it for a reply that says nothing about it', async () => {
+      const { chrome } = await withPassOnTab(undefined);
+      expect(chrome.storage._store.activeSessions['tab:42:instagram.com']).toBeUndefined();
+    });
+
+    // The contrast case: a check-in that really did go up owns the session
+    // now, and banking it here would take the outcome away from the
+    // conversation the user is having about it.
+    it('leaves the session alone when the check-in really went up', async () => {
+      const { chrome } = await withPassOnTab({ shown: true });
+      expect(chrome.storage._store.activeSessions['tab:42:instagram.com']).toBeDefined();
+      expect(chrome.storage._store.activeSessions['tab:42:instagram.com'].endedAt).toBeUndefined();
+    });
+
+    // A tab can hold passes on two blocked sites at once, so the page cannot
+    // tell which one expired without being told.
+    it('names the domain whose pass expired', async () => {
+      const { sent } = await withPassOnTab({ shown: true });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].message).toEqual({ action: 'showCheckin', domain: 'instagram.com' });
+    });
   });
 });
 
@@ -609,6 +665,321 @@ describe('entitlement storage', () => {
     expect(access.customProvider).toBe('anthropic');
     expect(JSON.stringify(access)).not.toContain('test-key');
   });
+
+  // The throttle marker for "when did this device last ask the backend whether
+  // a balance was still attached to its account id". It is not on the
+  // whitelist by accident anywhere else: dropped, a fresh install would
+  // re-hit an unauthenticated, per-IP rate-limited endpoint on every settings
+  // open, on behalf of everyone behind the same NAT.
+  it('round-trips the recovery-check marker', async () => {
+    const { ctx, chrome } = loadBackground();
+    await ctx.handleMessage({
+      action: 'saveEntitlement',
+      entitlement: { ...ACTIVE_ENTITLEMENT, recoveryCheckedAt: 1710000000000 }
+    }, {});
+    expect(chrome.storage._store.entitlement.recoveryCheckedAt).toBe(1710000000000);
+    await ctx.handleMessage({ action: 'saveEntitlement', entitlement: { ...ACTIVE_ENTITLEMENT } }, {});
+    expect(chrome.storage._store.entitlement.recoveryCheckedAt).toBe(0);
+  });
+
+  // How the session behind the token proved itself, as the server stamped it.
+  // The options page decides from it whether a recovery code may be offered at
+  // all, so like the marker above it is dropped on every save unless it is on
+  // the whitelist — and the page would then re-learn nothing and go on offering
+  // a button the server can only refuse.
+  it('round-trips the session kind the server stamped', async () => {
+    const { ctx, chrome } = loadBackground();
+    await ctx.handleMessage({ action: 'saveEntitlement',
+      entitlement: { ...ACTIVE_ENTITLEMENT, src: 'store' } }, {});
+    expect(chrome.storage._store.entitlement.src).toBe('store');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Writing an entitlement without clobbering one
+// ---------------------------------------------------------------------------
+//
+// saveEntitlement is a whole-object write, which is right when the caller has
+// just verified a purchase and holds the complete truth. It is wrong on the far
+// side of an unbounded await, and options-access.js's recovery check is exactly
+// that: it reads the entitlement, spends a network round trip on
+// /v1/entitlement/recover, and writes back what it read. A purchase verified in
+// between — returning from the Play sheet fires 'intention-app-active', which
+// runs a second refreshAccessUI, which is precisely when a top-up completes —
+// was overwritten by the snapshot. That took the money and locked the user out:
+// receipt gone, so nothing could re-verify, and the recoveryCheckedAt written
+// in its place suppressed the re-check for a day.
+describe('mergeEntitlement', () => {
+  const PURCHASE = {
+    active: true, source: 'google', token: 'TOKEN-FROM-PURCHASE',
+    receipt: 'PLAY-RECEIPT', balanceCredits: 5000, src: 'store'
+  };
+
+  it('writes only the keys it was given, over whatever is stored now', async () => {
+    const { ctx, chrome } = loadBackground({ seed: { entitlement: { ...PURCHASE } } });
+    const res = await ctx.handleMessage({
+      action: 'mergeEntitlement', entitlement: { recoveryCheckedAt: 1710000000000 }
+    }, {});
+    expect(res.ok).toBe(true);
+    expect(chrome.storage._store.entitlement).toMatchObject({ ...PURCHASE, recoveryCheckedAt: 1710000000000 });
+    expect(res.entitlement.balanceCredits).toBe(5000);
+  });
+
+  // The shape of the defect, side by side. Both callers hold the same stale
+  // snapshot — an empty entitlement read before the purchase existed — and are
+  // writing the one thing they learned on top of it. Only one of them can do
+  // that without taking the purchase with it.
+  it('is the difference between recording an answer and undoing a purchase', async () => {
+    const stale = { active: false, source: '', recoveryCheckedAt: 1710000000000 };
+
+    const saving = loadBackground({ seed: { entitlement: { ...PURCHASE } } });
+    await saving.ctx.handleMessage({ action: 'saveEntitlement', entitlement: stale }, {});
+    expect(saving.chrome.storage._store.entitlement.token).toBe('');
+    expect(saving.chrome.storage._store.entitlement.receipt).toBe(null);
+    expect(saving.chrome.storage._store.entitlement.balanceCredits).toBe(0);
+
+    const merging = loadBackground({ seed: { entitlement: { ...PURCHASE } } });
+    await merging.ctx.handleMessage({
+      action: 'mergeEntitlement', entitlement: { recoveryCheckedAt: stale.recoveryCheckedAt }
+    }, {});
+    const stored = merging.chrome.storage._store.entitlement;
+    expect(stored.token).toBe('TOKEN-FROM-PURCHASE');
+    expect(stored.receipt).toBe('PLAY-RECEIPT');
+    expect(stored.balanceCredits).toBe(5000);
+    expect(stored.recoveryCheckedAt).toBe(stale.recoveryCheckedAt);
+  });
+
+  it('starts from nothing when nothing is stored, and normalizes like a save', async () => {
+    const { ctx, chrome } = loadBackground();
+    await ctx.handleMessage({
+      action: 'mergeEntitlement', entitlement: { recoveryCheckedAt: 5, junk: 'x' }
+    }, {});
+    expect(chrome.storage._store.entitlement.active).toBe(false);
+    expect(chrome.storage._store.entitlement.recoveryCheckedAt).toBe(5);
+    expect(chrome.storage._store.entitlement.junk).toBeUndefined();
+  });
+
+  it('leaves the stored entitlement alone when handed nothing to merge', async () => {
+    const { ctx, chrome } = loadBackground({ seed: { entitlement: { ...PURCHASE } } });
+    const res = await ctx.handleMessage({ action: 'mergeEntitlement', entitlement: null }, {});
+    expect(res.ok).toBe(false);
+    expect(chrome.storage._store.entitlement.token).toBe('TOKEN-FROM-PURCHASE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The balance, where it can actually be seen
+// ---------------------------------------------------------------------------
+//
+// "There seems to be no means to see credit balance" was fair: formatBalance()
+// was only reachable from inside the paywall, which is the one surface someone
+// who has already paid never opens again. getAccess is what the settings chip
+// and the gate note both read, so the two exclusions that keep them honest are
+// decided once, here.
+describe('getAccess reports the balance', () => {
+  const withCredits = (balanceCredits) => ({ ...ACTIVE_ENTITLEMENT, balanceCredits });
+
+  it('hands back the credit balance alongside the route', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: withCredits(1240) } });
+    const access = await ctx.handleMessage({ action: 'getAccess' }, {});
+    expect(access.route).toBe('hosted');
+    expect(access.balanceCredits).toBe(1240);
+    expect(access.lowCredit).toBe(false);
+  });
+
+  it('flags a balance at or under the shared threshold as low', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: withCredits(ctxThreshold()) } });
+    const access = await ctx.handleMessage({ action: 'getAccess' }, {});
+    expect(access.lowCredit).toBe(true);
+    expect(access.balanceCredits).toBe(ctxThreshold());
+  });
+
+  it('does not flag one credit above it', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: withCredits(ctxThreshold() + 1) } });
+    expect((await ctx.handleMessage({ action: 'getAccess' }, {})).lowCredit).toBe(false);
+  });
+
+  // Zero is LOCKED, not low. A different state with a different screen behind
+  // it — the paywall replaces the conversation — so a warning here would be
+  // the third time in one session that a dead account was made to look merely
+  // unwell.
+  it('treats an exhausted balance as locked rather than low', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: { ...ACTIVE_ENTITLEMENT, active: false, balanceCredits: 0 } } });
+    const access = await ctx.handleMessage({ action: 'getAccess' }, {});
+    expect(access.route).toBe('locked');
+    expect(access.balanceCredits).toBe(0);
+    expect(access.lowCredit).toBe(false);
+  });
+
+  // The gate paints this line on every blocked page, so getAccess is now asked
+  // from inside arbitrary web pages. The entitlement carries a bearer token
+  // that can SPEND the balance — the numbers are all a content script needs,
+  // and this is the same rule getConfig already applies to apiKey.
+  it('withholds the entitlement token from a content-script sender', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: withCredits(1240) } });
+    const page = { url: 'https://instagram.com/', tab: { id: 4 } };
+    const access = await ctx.handleMessage({ action: 'getAccess' }, page);
+    expect(access.entitlement).toBe(null);
+    expect(JSON.stringify(access)).not.toContain('entitlement-token');
+    // ...while still answering the question it was asked.
+    expect(access.route).toBe('hosted');
+    expect(access.balanceCredits).toBe(1240);
+  });
+
+  it('still hands the whole entitlement to an extension page', async () => {
+    const { ctx, chrome } = loadBackground({ seed: { entitlement: withCredits(1240) } });
+    const optionsPage = { url: chrome.runtime.getURL('options.html') };
+    const access = await ctx.handleMessage({ action: 'getAccess' }, optionsPage);
+    expect(access.entitlement.token).toBe('entitlement-token');
+  });
+
+  // getConfig returns the SAME stored object, and stripped only apiKey — so
+  // the control getAccess had just grown was half a control, and the next
+  // content-script feature that wanted any part of the config would have
+  // reopened it without anything failing to say so.
+  it('withholds the entitlement token from a content sender asking getConfig', async () => {
+    const { ctx } = loadBackground({ seed: { entitlement: withCredits(1240) } });
+    const page = { url: 'https://instagram.com/', tab: { id: 4 } };
+    const config = await ctx.handleMessage({ action: 'getConfig' }, page);
+    expect(config.entitlement).toBe(null);
+    expect(JSON.stringify(config)).not.toContain('entitlement-token');
+    // ...while still answering everything the page legitimately asks for.
+    expect(config.accessRoute).toBe('hosted');
+    expect(config.blockedDomains).toEqual([]);
+  });
+
+  // The native hosts keep it, and that is the difference from apiKey. Android
+  // and iOS deliver an empty sender for EVERY message, including the ones our
+  // own settings page sends — and options-access.js reconciles a purchase
+  // against this token, so blanking it here would break restore on the only
+  // two builds that sell anything.
+  it('still hands it to an extension page and a native host', async () => {
+    for (const sender of [EXT_PAGE, NATIVE]) {
+      const { ctx } = loadBackground({ seed: { entitlement: withCredits(1240) } });
+      const config = await ctx.handleMessage({ action: 'getConfig' }, sender);
+      expect(config.entitlement.token).toBe('entitlement-token');
+    }
+  });
+
+  // A custom key has no balance with us at all, so "running low" would not be
+  // a small inaccuracy — it would tell someone they had run out of something
+  // they never bought.
+  it('never flags a custom-key route, whatever is stored', async () => {
+    const { ctx } = loadBackground({ seed: { ...CONFIGURED, entitlement: withCredits(5) } });
+    const access = await ctx.handleMessage({ action: 'getAccess' }, {});
+    expect(access.route).toBe('byok');
+    expect(access.lowCredit).toBe(false);
+  });
+});
+
+// Read out of providers.js rather than repeated, so this suite cannot pass
+// against a threshold the shipped code no longer uses.
+function ctxThreshold() {
+  return loadBackground().ctx.LOW_CREDIT_CREDITS;
+}
+
+// ---------------------------------------------------------------------------
+// ...and what the gate does with that answer
+// ---------------------------------------------------------------------------
+//
+// getAccess hands back the stored balance on every route, because the settings
+// page wants the number even when it will not paint it. Deciding what that
+// means is the reader's job, and one of the two readers was not doing it:
+// options.js's chip goes to explicit lengths to hide itself on 'byok' ("a chip
+// reading 0 would not be a small inaccuracy, it would be the wrong mental
+// model"), while gate-ui.js's credit note was never told the route at all. So a
+// user who bought credit, spent some, then pointed the coach at their own
+// Anthropic key was told "830 coaching credits left" on every blocked page
+// while every message was billed to that key.
+//
+// The two surfaces are fed the same getAccess response here, on purpose: the
+// bug was that they disagreed about it.
+function creditNote(access) {
+  const note = {
+    id: 'int-credit-note', textContent: '', hidden: false,
+    dataset: { persistent: '' }, classList: { toggle() {} }
+  };
+  const sandbox = {
+    document: { getElementById: (id) => (id === 'int-credit-note' ? note : null), createElement: () => ({}) },
+    window: { addEventListener() {}, removeEventListener() {}, location: { href: '' } },
+    console: { log() {}, warn() {}, error() {} },
+    navigator: { userAgent: 'Chrome/120' },
+    chrome: { runtime: { sendMessage: (msg, cb) => cb(access), lastError: null } },
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    Math, JSON, Promise, Error, Object, Array, String, Number, Date
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+  evaluateScripts(context, filesForContext('content', { only: ['report.js', 'gate-ui.js'] }));
+  sandbox.loadCreditNote();
+  return note;
+}
+
+describe('the gate credit note reads the same answer the chip does', () => {
+  const access = async (seed) => {
+    const { ctx } = loadBackground({ seed });
+    return ctx.handleMessage({ action: 'getAccess' }, {});
+  };
+
+  it('says nothing on a custom key, whatever balance is left over from before', async () => {
+    const byok = await access({ ...CONFIGURED, entitlement: { ...ACTIVE_ENTITLEMENT, balanceCredits: 830 } });
+    expect(byok.route).toBe('byok');
+    // The number is still in the response — the settings page is entitled to
+    // it — and the note still has to keep quiet about it.
+    expect(byok.balanceCredits).toBe(830);
+    const note = creditNote(byok);
+    expect(note.hidden).toBe(true);
+    expect(note.textContent).toBe('');
+  });
+
+  it('paints the balance on the hosted route, where it is being spent', async () => {
+    const hosted = await access({ entitlement: { ...ACTIVE_ENTITLEMENT, balanceCredits: 830 } });
+    expect(hosted.route).toBe('hosted');
+    expect(creditNote(hosted).textContent).toBe('830 coaching credits left.');
+  });
+
+  it('warns when the hosted balance is low', async () => {
+    const low = await access({ entitlement: { ...ACTIVE_ENTITLEMENT, balanceCredits: ctxThreshold() } });
+    expect(creditNote(low).textContent).toContain('running low');
+  });
+
+  // Zero is locked, and the paywall is already saying that louder.
+  it('says nothing at zero, on any route', async () => {
+    const locked = await access({ entitlement: { ...ACTIVE_ENTITLEMENT, active: false, balanceCredits: 0 } });
+    expect(locked.route).toBe('locked');
+    expect(creditNote(locked).hidden).toBe(true);
+  });
+});
+
+// The gate paints a credit line after every turn. Without the ride-along it
+// would have to ask getAccess for a number the response it just received was
+// already carrying — a second round trip per message, for a balance this
+// message is what changed.
+describe('handleChat carries the balance back', () => {
+  it('reports the balance the hosted call answered with', async () => {
+    const fetch = makeMockFetch({ text: 'Okay.', toolCalls: [], balanceCredits: 900, balanceMicros: 9, balanceGbp: 0.9 });
+    const { ctx } = loadBackground({ seed: { entitlement: ACTIVE_ENTITLEMENT }, fetch });
+    const res = await ctx.handleChat({ tabId: 1, mode: 'gate', domain: 'x.com', userMessage: 'hi' });
+    expect(res.balanceCredits).toBe(900);
+    expect(res.lowCredit).toBe(false);
+  });
+
+  it('flags a low balance with the same threshold getAccess uses', async () => {
+    const fetch = makeMockFetch({ text: 'Okay.', toolCalls: [], balanceCredits: ctxThreshold() });
+    const { ctx } = loadBackground({ seed: { entitlement: ACTIVE_ENTITLEMENT }, fetch });
+    const res = await ctx.handleChat({ tabId: 1, mode: 'gate', domain: 'x.com', userMessage: 'hi' });
+    expect(res.lowCredit).toBe(true);
+  });
+
+  // A route with no balance behind it says nothing at all, rather than
+  // reporting a zero the gate would have to know to ignore.
+  it('says nothing about a balance on a custom-key route', async () => {
+    const fetch = makeMockFetch({ content: [{ type: 'text', text: 'Okay.' }] });
+    const { ctx } = loadBackground({ seed: CONFIGURED, fetch });
+    const res = await ctx.handleChat({ tabId: 1, mode: 'gate', domain: 'x.com', userMessage: 'hi' });
+    expect(res.balanceCredits).toBeUndefined();
+    expect(res.lowCredit).toBe(false);
+  });
 });
 
 describe('checkPageMatch reports access', () => {
@@ -679,15 +1050,87 @@ describe('candidate visit tally', () => {
 });
 
 describe('setup no longer collects credentials', () => {
+  // The shape the wizard actually sends: it carries the credential fields
+  // through from storage precisely so finishing setup cannot wipe a key, and
+  // on a build that never offered one they arrive as empty strings.
   it('completes with no provider or key', async () => {
     const { ctx, chrome } = loadBackground();
     await ctx.handleMessage({
       action: 'saveSetup',
-      config: { userContext: 'ctx', blockedDomains: ['x.com'], domainLimits: {} }
+      config: { provider: '', apiKey: '', model: '', userContext: 'ctx', blockedDomains: ['x.com'], domainLimits: {} }
     }, {});
     expect(chrome.storage._store.setupComplete).toBe(true);
     expect(chrome.storage._store.apiKey).toBe('');
     expect(chrome.storage._store.provider).toBe('');
+  });
+});
+
+// saveSetup writes every field it is GIVEN. It used to write every field it
+// could name, present or not, so `|| ''` turned "not mentioned" into
+// "cleared" — and options-wizard.js omits userContext, contextProjects and
+// contextReasons on purpose, with a comment saying that omitting them is what
+// protects context an existing user built up with the coach. It was not.
+describe('saveSetup only writes the fields it was given', () => {
+  const EXISTING = {
+    setupComplete: true,
+    userContext: 'writing a dissertation on lichens',
+    contextProjects: 'the dissertation',
+    contextReasons: 'I keep opening reddit at 1am',
+    apiKey: 'sk-real-key',
+    provider: 'anthropic',
+    appLabels: { 'com.instagram.android': 'Instagram' },
+    blockedDomains: ['reddit.com']
+  };
+  // Exactly what options-wizard.js sends: the three context keys absent.
+  const WIZARD = {
+    provider: 'anthropic', apiKey: 'sk-real-key', model: '',
+    blockedDomains: ['reddit.com', 'x.com'], domainLimits: {},
+    blockedApps: [], appLimits: {}, appLabels: { 'com.instagram.android': 'Instagram' },
+    serviceReasons: {}, blockingMode: 'coach', simpleBehavior: 'pass', simplePassMinutes: 10
+  };
+
+  it('leaves the coach context alone when the wizard omits it', async () => {
+    const { ctx, chrome } = loadBackground({ seed: { ...EXISTING } });
+    await ctx.handleMessage({ action: 'saveSetup', config: { ...WIZARD } }, {});
+    expect(chrome.storage._store.userContext).toBe('writing a dissertation on lichens');
+    expect(chrome.storage._store.contextProjects).toBe('the dissertation');
+    expect(chrome.storage._store.contextReasons).toBe('I keep opening reddit at 1am');
+    // ...and still writes what it WAS given.
+    expect(chrome.storage._store.blockedDomains).toEqual(['reddit.com', 'x.com']);
+    expect(chrome.storage._store.setupComplete).toBe(true);
+  });
+
+  // Present-but-empty is a real answer and still clears the field: the
+  // distinction is absence, not falsiness.
+  it('still clears a field that was sent as empty', async () => {
+    const { ctx, chrome } = loadBackground({ seed: { ...EXISTING } });
+    await ctx.handleMessage({ action: 'saveSetup', config: { ...WIZARD, userContext: '' } }, {});
+    expect(chrome.storage._store.userContext).toBe('');
+  });
+
+  // An omitted blocklist is the same trap wearing the blocklist's clothes:
+  // "cleared" here means every blocked site silently unblocked. An omitted
+  // limits map is the same trap again — the sites stay blocked and lose their
+  // grant and minute caps.
+  it('does not unblock everything when the blocklist is omitted', async () => {
+    const { ctx, chrome } = loadBackground({
+      seed: { ...EXISTING, domainLimits: { 'reddit.com': { maxGrants: 2, maxMinutes: 30 } } }
+    });
+    const noList = { ...WIZARD };
+    delete noList.blockedDomains;
+    delete noList.domainLimits;
+    await ctx.handleMessage({ action: 'saveSetup', config: noList }, {});
+    expect(chrome.storage._store.blockedDomains).toEqual(['reddit.com']);
+    expect(chrome.storage._store.domainLimits).toEqual({ 'reddit.com': { maxGrants: 2, maxMinutes: 30 } });
+  });
+
+  // "When they started", not "when they last pressed Finish": the leaving
+  // conversation reads it to say how long they have been at this.
+  it('keeps the original setup date rather than restamping it', async () => {
+    const started = Date.now() - 40 * 86400000;
+    const { ctx, chrome } = loadBackground({ seed: { ...EXISTING, setupCompletedAt: started } });
+    await ctx.handleMessage({ action: 'saveSetup', config: { ...WIZARD } }, {});
+    expect(chrome.storage._store.setupCompletedAt).toBe(started);
   });
 });
 
@@ -794,7 +1237,7 @@ describe('the gate prompt carries the per-service answers', () => {
     const fetch = makeMockFetch({ text: 'Okay.', toolCalls: [] });
     const { ctx } = loadBackground({ seed: { entitlement: ACTIVE_ENTITLEMENT }, fetch });
     await ctx.handleChat({ tabId: 1, mode: 'gate', domain: 'instagram.com', userMessage: 'hi' });
-    expect(systemPromptOf(fetch)).not.toContain('Why they said they need');
+    expect(systemPromptOf(fetch)).not.toContain('Why they blocked');
   });
 });
 
@@ -2198,28 +2641,6 @@ describe('note_observation', () => {
   });
 });
 
-describe('save_onboarding limits', () => {
-  it('stores -1, not NaN, when the model omits a daily minutes cap', async () => {
-    const fetch = makeMockFetch({
-      content: [
-        { type: 'text', text: 'Saved.' },
-        {
-          type: 'tool_use', id: 't1', name: 'save_onboarding',
-          input: {
-            user_context: 'me',
-            blocked_domains: ['y.com'],
-            domain_limits: [{ domain: 'y.com', max_grants_per_day: 2 }]
-          }
-        }
-      ]
-    });
-    const { ctx, chrome } = loadBackground({ seed: CONFIGURED, fetch });
-    await ctx.handleMessage({ action: 'chat', mode: 'setup', userMessage: 'done' }, EXT_PAGE);
-    // `Number(undefined) ?? -1` was NaN, which read as an always-hit cap.
-    expect(chrome.storage._store.domainLimits['y.com']).toEqual({ maxGrants: 2, maxMinutes: -1 });
-  });
-});
-
 // Reporting a coach message (Play's AI-Generated Content policy). The page
 // sends only the text it can see; everything else is resolved here, because a
 // page has no stable handle on a turn — they carry no ids, and histories are
@@ -2499,5 +2920,1671 @@ describe('applySettingChange: rewriting what a service is for', () => {
       changeType: 'edit_site_purpose', domain: 'instagram.com', newValue: ''
     });
     expect(chrome.storage._store.serviceReasons['instagram.com']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Page-scoped passes.
+//
+// A scoped pass is one granted for a single page rather than the whole site.
+// It lives as an optional `scope` key on the session value, and its absence —
+// never `{ kind: 'site' }` — is what every pass granted before this existed
+// and every whole-site pass granted since still looks like.
+//
+// The single most important thing in this file is the first describe below.
+// Get it wrong and a pass "for one video" silently opens the entire site while
+// the badge says THIS PAGE ONLY.
+// ---------------------------------------------------------------------------
+
+const VIDEO_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+const OTHER_VIDEO_URL = 'https://www.youtube.com/watch?v=oHg5SJYRHA0';
+const VIDEO_CTX = {
+  url: VIDEO_URL,
+  contentType: 'YouTube Video',
+  videoTitle: 'Never Gonna Give You Up',
+  channel: 'Rick Astley'
+};
+const FEED_CTX = {
+  url: 'https://www.youtube.com/',
+  contentType: 'YouTube Page'
+};
+
+const YT_BLOCKED = { ...CONFIGURED, setupComplete: true, blockedDomains: ['youtube.com'] };
+
+// A pass granted for one page, as grantSession writes it.
+const scopedSession = (url = VIDEO_URL) => ({
+  domain: 'youtube.com',
+  reason: 'someone sent me this',
+  startTime: Date.now(),
+  intervalMinutes: 12,
+  scope: {
+    kind: 'page',
+    key: `yt:video:${new URL(url).searchParams.get('v')}`,
+    url,
+    label: 'Never Gonna Give You Up',
+    verb: 'Watching'
+  }
+});
+
+// Only the calls that carried a conversation. The same mock fetch also answers
+// page-context enrichment (oEmbed and the like), which is not a coach turn.
+const llmCalls = (fetch) => fetch.calls.filter(c => {
+  try { return Array.isArray(JSON.parse(c.init.body).messages); } catch (e) { return false; }
+});
+
+// An LLM reply that grants `minutes` scoped the way `scope` says.
+function scopedGrantFetch(minutes = 12, scope = 'page', reason = 'someone sent me this') {
+  return makeMockFetch({
+    content: [
+      { type: 'text', text: 'Okay.' },
+      { type: 'tool_use', id: 't1', name: 'grant_access', input: { minutes, reason, scope } }
+    ]
+  });
+}
+
+// Drives a whole gate conversation on a YouTube video and returns the reply.
+async function grantOnVideo(ctx, { tabId = 7, pageContext = VIDEO_CTX, domain = 'youtube.com' } = {}) {
+  return ctx.handleMessage(
+    { action: 'chat', mode: 'gate', domain, userMessage: 'a', pageContext },
+    { tab: { id: tabId }, url: pageContext ? pageContext.url : `https://${domain}/` }
+  );
+}
+
+describe('a scoped pass keeps the rest of the site blocked', () => {
+  // THE assertion of this feature. The narrowed per-tab allow rule lets the
+  // one granted page through; the domain redirect rule has to still be there
+  // to catch everything else.
+  it('KEEPS the domain redirect rule while a page-scoped pass is live', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    const dnr = statefulDnr(chrome);
+    await ctx.syncBlockingRules();
+    expect(dnr.redirectedDomains()).toEqual(['||youtube.com^']);
+
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.scope).toMatchObject({ kind: 'page', key: 'yt:video:dQw4w9WgXcQ' });
+    expect(dnr.redirectedDomains()).toEqual(['||youtube.com^']);
+  });
+
+  // ...but only where the priority-2 allow rule can be relied on to beat the
+  // priority-1 redirect. Keeping both rules up for one host is the only
+  // construct in the extension that needs that ordering, and it is verified on
+  // exactly one engine — the smoke suite drives a real scoped grant through a
+  // real Chromium. Firefox's MV3 DNR is a partial implementation and nothing
+  // here can check it, so a scoped pass degrades there to what a site pass
+  // does: the redirect goes, and the content script's overlay enforces the
+  // scope, which is how Safari enforces every pass today.
+  //
+  // The failure this avoids is not "the block is a bit weaker". It is the
+  // trap: redirect wins, the granted page bounces to coaching.html, coaching.js
+  // sends the user back to scope.url, and it bounces again — for the whole
+  // length of a pass they paid a conversation for.
+  it('degrades to a site pass on an engine whose rule ordering is unverified', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    const dnr = statefulDnr(chrome);
+    // runtime.getBrowserInfo is Firefox's and nobody else's. (Chrome exposes a
+    // `browser` alias of `chrome`, so the namespace alone says nothing; Safari
+    // has a native host and never reaches this function at all.)
+    ctx.browser = { runtime: { getBrowserInfo: async () => ({ name: 'Firefox' }) } };
+    await ctx.syncBlockingRules();
+    expect(dnr.redirectedDomains()).toEqual(['||youtube.com^']);
+
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.scope).toMatchObject({ kind: 'page' });
+    expect(dnr.redirectedDomains()).toEqual([]);
+  });
+
+  // ...and the redirect comes back when that pass ends, which on Chromium is
+  // the no-op the idempotence check exists for and here is a real restore.
+  it('puts the redirect back when a degraded scoped pass ends', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    const dnr = statefulDnr(chrome);
+    ctx.browser = { runtime: { getBrowserInfo: async () => ({ name: 'Firefox' }) } };
+    await grantOnVideo(ctx);
+    expect(dnr.redirectedDomains()).toEqual([]);
+    await ctx.handleMessage(
+      { action: 'endSession', domain: 'youtube.com', reason: 'left_page' },
+      { tab: { id: 7 }, url: OTHER_VIDEO_URL }
+    );
+    expect(dnr.redirectedDomains()).toEqual(['||youtube.com^']);
+  });
+
+  // The contrast case, and the reason the line above is a filter and not a
+  // deletion: an unscoped pass must still drop the rule, or the user is thrown
+  // back onto the gate they just talked their way through.
+  it('still drops it for an unscoped pass, exactly as before', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(12, 'site') });
+    const dnr = statefulDnr(chrome);
+    await ctx.syncBlockingRules();
+
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.scope).toBeUndefined();
+    expect(dnr.redirectedDomains()).toEqual([]);
+  });
+
+  it('puts nothing back when the scoped pass ends, because it never left', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    const dnr = statefulDnr(chrome);
+    await grantOnVideo(ctx);
+    await ctx.handleMessage(
+      { action: 'endSession', domain: 'youtube.com', reason: 'left_page' },
+      { tab: { id: 7 }, url: OTHER_VIDEO_URL }
+    );
+    expect(dnr.redirectedDomains()).toEqual(['||youtube.com^']);
+  });
+
+  // A summary that compares only what a rule catches and where it sends the
+  // user cannot tell an allow from a redirect, or a narrowed rule from the one
+  // it replaced — so the difference would never be applied.
+  it('notices a rule set that differs only in action type or priority', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED });
+    statefulDnr(chrome);
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      addRules: [{
+        id: 1000,
+        priority: 4,
+        action: { type: 'allow' },
+        condition: { urlFilter: '||youtube.com^', resourceTypes: ['main_frame'] }
+      }]
+    });
+
+    await ctx.syncBlockingRules();
+
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0].action.type).toBe('redirect');
+    expect(rules[0].priority).toBe(1);
+  });
+});
+
+describe('the per-tab allow rule a scoped pass registers', () => {
+  const filters = (chrome) => chrome.declarativeNetRequest._sessionRules.map(r => r.condition.urlFilter);
+
+  // Anchored at BOTH ends. A leading `|` alone says "the URL starts like
+  // this", which for a rule that lets traffic PAST a block is a prefix hole —
+  // see dnrUrlFilterFor, which now closes it.
+  it('names the one granted page, not the whole domain', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    await grantOnVideo(ctx);
+    expect(filters(chrome)).toEqual([`|${VIDEO_URL}|`]);
+  });
+
+  it('is the whole domain for an unscoped pass', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(12, 'site') });
+    await grantOnVideo(ctx);
+    expect(filters(chrome)).toEqual(['||youtube.com^']);
+  });
+
+  // urlFilter is not a glob: `*`, `^` and `|` are pattern syntax, and a
+  // non-ASCII byte takes the whole batch down. dnrUrlFilterFor answers '' for
+  // those, and enforcement falls back to the content script — which is how
+  // Safari has always enforced every pass.
+  it('falls back to the whole domain when the address cannot be a filter', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED });
+    // A `*` in the path survives URL parsing untouched, and urlFilter would
+    // read it as a wildcard — an allow rule matching more than the page it was
+    // built for is the failure that matters here, so no rule is built at all.
+    await ctx.registerSessionRule(9, {
+      domain: 'youtube.com',
+      scope: { kind: 'page', key: 'url:x', url: 'https://www.youtube.com/wat*ch' }
+    });
+    expect(filters(chrome)).toEqual(['||youtube.com^']);
+  });
+
+  // The middle answer used to be "drop the query and anchor the path". That
+  // rule could never match — a query is the only reason it was reached, and
+  // both ends are anchored — so the allow rule never fired while the
+  // priority-1 domain redirect did, and the granted page bounced to
+  // coaching.html forever. '' now, and the caller widens to the domain for
+  // this tab.
+  it('gives up rather than emitting a rule that could never match its own url', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED });
+    await ctx.registerSessionRule(9, {
+      domain: 'youtube.com',
+      scope: { kind: 'page', key: 'url:x', url: 'https://www.youtube.com/watch?v=a^b' }
+    });
+    expect(filters(chrome)).toEqual(['||youtube.com^']);
+  });
+
+  // The default is case-INSENSITIVE, which for an allow rule naming one page
+  // means it also names every case-variant of it. Instagram shortcodes are
+  // case-sensitive, so /p/ABC123/ and /p/abc123/ are different posts.
+  it('is case-sensitive, so it cannot allow a different post with the same letters', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED });
+    await ctx.registerSessionRule(9, {
+      domain: 'instagram.com',
+      scope: { kind: 'page', key: 'ig:post:ABC123', url: 'https://www.instagram.com/p/ABC123/' }
+    });
+    const rule = chrome.declarativeNetRequest._sessionRules.at(-1);
+    expect(rule.condition.urlFilter).toBe('|https://www.instagram.com/p/ABC123/|');
+    expect(rule.condition.isUrlFilterCaseSensitive).toBe(true);
+  });
+
+  // The whole-domain fallback is the one that clears the redirect for the tab,
+  // so it carries the same flag rather than quietly reverting to the default.
+  it('sets it on the whole-domain fallback too', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED });
+    await ctx.registerSessionRule(9, { domain: 'youtube.com' });
+    expect(chrome.declarativeNetRequest._sessionRules.at(-1).condition.isUrlFilterCaseSensitive).toBe(true);
+  });
+
+  // A tab can hold a pass on two blocked sites; ending one must not widen the
+  // other from one page to the whole site.
+  it('is rebuilt from the surviving session, scope and all', async () => {
+    const { ctx, chrome } = loadBackground({
+      seed: {
+        ...YT_BLOCKED,
+        blockedDomains: ['youtube.com', 'instagram.com'],
+        activeSessions: {
+          'tab:5:youtube.com': {
+            domain: 'youtube.com', startTime: Date.now(), intervalMinutes: 10,
+            scope: { kind: 'page', key: 'yt:video:dQw4w9WgXcQ', url: VIDEO_URL, label: 'x', verb: 'Watching' }
+          },
+          'tab:5:instagram.com': { domain: 'instagram.com', startTime: Date.now(), intervalMinutes: 10 }
+        }
+      }
+    });
+    await ctx.handleMessage(
+      { action: 'endSession', domain: 'instagram.com', reason: 'fulfilled' },
+      { tab: { id: 5 }, url: 'https://www.instagram.com/' }
+    );
+    expect(filters(chrome)).toEqual([`|${VIDEO_URL}|`]);
+  });
+});
+
+describe('grant_access with scope "page"', () => {
+  it('writes the scope onto the session and banks the grant as page-scoped', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    await grantOnVideo(ctx);
+
+    const session = chrome.storage._store.activeSessions['tab:7:youtube.com'];
+    expect(session.scope).toEqual({
+      kind: 'page',
+      key: 'yt:video:dQw4w9WgXcQ',
+      url: VIDEO_URL,
+      label: 'Never Gonna Give You Up',
+      verb: 'Watching'
+    });
+    const stats = await ctx.getStatsForDomain('youtube.com');
+    expect(stats.sessionsToday[0].scope).toBe('page');
+  });
+
+  // Absence is the third state. A site pass must not write `{ kind: 'site' }`,
+  // because three native readers of this value have never heard of the field.
+  it('leaves no scope key at all on a site pass', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(12, 'site') });
+    await grantOnVideo(ctx);
+    const session = chrome.storage._store.activeSessions['tab:7:youtube.com'];
+    expect('scope' in session).toBe(false);
+    const stats = await ctx.getStatsForDomain('youtube.com');
+    expect(stats.sessionsToday[0].scope).toBe(null);
+  });
+
+  it('reads an omitted scope as a site pass, so an older model still works', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: grantingFetch(12) });
+    await ctx.handleMessage(
+      { action: 'chat', mode: 'gate', domain: 'youtube.com', userMessage: 'a', pageContext: VIDEO_CTX },
+      { tab: { id: 7 }, url: VIDEO_URL }
+    );
+    expect('scope' in chrome.storage._store.activeSessions['tab:7:youtube.com']).toBe(false);
+  });
+
+  // A feed has no single page to pin to. The pass is still granted — refusing
+  // it would punish the user for the model's word choice — but both channels
+  // have to say what actually happened.
+  it('downgrades on a feed, and tells both the user and the model', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch() });
+    const res = await grantOnVideo(ctx, { pageContext: FEED_CTX });
+
+    expect(res.grantedSession).toBeTruthy();
+    expect('scope' in chrome.storage._store.activeSessions['tab:7:youtube.com']).toBe(false);
+    expect(res.systemNote).toContain('no single page to pin that to');
+  });
+
+  it('spends a correction turn saying so in the coach voice', async () => {
+    const fetch = scopedGrantFetch();
+    const { ctx } = loadBackground({ seed: YT_BLOCKED, fetch });
+    await grantOnVideo(ctx, { pageContext: FEED_CTX });
+    // Two coach calls: the grant, then the honesty turn the correction forces.
+    // (The mock fetch also sees page-context enrichment, which is not one.)
+    expect(llmCalls(fetch)).toHaveLength(2);
+    const messages = JSON.parse(fetch.calls.at(-1).init.body).messages;
+    expect(messages.at(-1).content).toContain('could not identify a single page');
+    expect(messages.at(-1).content).toContain('WHOLE SITE');
+  });
+
+  // Android and iOS block whole apps: there is no address, no path, nothing to
+  // scope to. pageScopeFor must never be reached for one.
+  it('never scopes an app target, however the model asks', async () => {
+    const { ctx, chrome } = loadBackground({
+      seed: { ...CONFIGURED, setupComplete: true, blockedApps: ['com.instagram.android'] },
+      fetch: scopedGrantFetch()
+    });
+    const res = await ctx.handleMessage(
+      { action: 'chat', mode: 'gate', domain: 'com.instagram.android', isApp: true,
+        appLabel: 'Instagram', userMessage: 'a', pageContext: VIDEO_CTX },
+      NATIVE
+    );
+    expect(res.grantedSession).toBeTruthy();
+    expect('scope' in chrome.storage._store.activeSessions['target:com.instagram.android']).toBe(false);
+    expect(res.systemNote).toContain('no single page to pin that to');
+  });
+
+  it('tells the coach in the prompt what kind of pass is on the table', async () => {
+    const fetch = scopedGrantFetch();
+    const { ctx } = loadBackground({ seed: YT_BLOCKED, fetch });
+    await grantOnVideo(ctx);
+    expect(systemPromptOf(fetch)).toContain('grant_access with scope "page"');
+
+    const feedFetch = scopedGrantFetch();
+    const feed = loadBackground({ seed: YT_BLOCKED, fetch: feedFetch });
+    await grantOnVideo(feed.ctx, { pageContext: FEED_CTX });
+    expect(systemPromptOf(feedFetch)).toContain('Scoped passes: not available here');
+  });
+});
+
+describe('the strict phase is looser for a scoped pass, and only there', () => {
+  // looseUntilMinutes 5, already 30 minutes in: strict, whatever else happens.
+  const STRICT = (extra = {}) => ({
+    ...YT_BLOCKED,
+    domainLimits: { 'youtube.com': { looseUntilMinutes: 5, ...extra } },
+    dailyStats: {
+      [today()]: { 'youtube.com': { minutes: 30, grants: 1, sessions: [{ grantedMinutes: 30, reason: 'x', grantedAt: Date.now() - 1 }] } }
+    }
+  });
+
+  it('clamps an unscoped grant at 10', async () => {
+    const { ctx } = loadBackground({ seed: STRICT(), fetch: scopedGrantFetch(45, 'site') });
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.intervalMinutes).toBe(10);
+  });
+
+  it('lets a scoped grant run to 20, because leaving the page ends it', async () => {
+    const { ctx } = loadBackground({ seed: STRICT(), fetch: scopedGrantFetch(45, 'page') });
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.intervalMinutes).toBe(20);
+    expect(res.grantedSession.scope).toBeTruthy();
+  });
+
+  // Neither ceiling above it moves. The day's total cannot grow because of a
+  // scoped pass — the remainder of the user's own daily cap still wins.
+  it('still loses to the daily minutes cap', async () => {
+    const { ctx } = loadBackground({
+      seed: STRICT({ maxMinutes: 38 }),
+      fetch: scopedGrantFetch(45, 'page')
+    });
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.intervalMinutes).toBe(8);
+  });
+
+  it('still loses to the 60-minute ceiling on any single pass', async () => {
+    const { ctx } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(600, 'page') });
+    const res = await grantOnVideo(ctx);
+    expect(res.grantedSession.intervalMinutes).toBe(60);
+  });
+});
+
+describe('the gate backstop knows which page a pass was for', () => {
+  const scopedSeed = {
+    setupComplete: true,
+    blockedDomains: ['youtube.com'],
+    activeSessions: {
+      'tab:4:youtube.com': {
+        domain: 'youtube.com', startTime: Date.now(), intervalMinutes: 10,
+        scope: { kind: 'page', key: 'yt:video:dQw4w9WgXcQ', url: VIDEO_URL, label: 'x', verb: 'Watching' }
+      }
+    }
+  };
+
+  it('stands down on the page the pass was granted for', async () => {
+    const { ctx, chrome } = loadBackground({ seed: scopedSeed });
+    chrome.tabs._byId[4] = { id: 4, url: VIDEO_URL };
+    await ctx.enforceGateBackstop(4, VIDEO_URL);
+    expect(chrome.tabs._updates).toHaveLength(0);
+  });
+
+  // Safari has no declarativeNetRequest gate at all, so this is the only
+  // enforcement behind the content script there.
+  it('still fires on a different page of the same site', async () => {
+    const { ctx, chrome } = loadBackground({ seed: scopedSeed });
+    chrome.tabs._byId[4] = { id: 4, url: OTHER_VIDEO_URL };
+    await ctx.enforceGateBackstop(4, OTHER_VIDEO_URL);
+    expect(chrome.tabs._updates).toHaveLength(1);
+    expect(chrome.tabs._updates[0].props.url).toContain('coaching.html?domain=youtube.com');
+  });
+
+  it('stands down anywhere on the site for a pass with no scope', async () => {
+    const { ctx, chrome } = loadBackground({
+      seed: {
+        ...scopedSeed,
+        activeSessions: {
+          'tab:4:youtube.com': { domain: 'youtube.com', startTime: Date.now(), intervalMinutes: 10 }
+        }
+      }
+    });
+    chrome.tabs._byId[4] = { id: 4, url: OTHER_VIDEO_URL };
+    await ctx.enforceGateBackstop(4, OTHER_VIDEO_URL);
+    expect(chrome.tabs._updates).toHaveLength(0);
+  });
+});
+
+describe('an in-page navigation the browser does notice', () => {
+  it('re-records the page context and pokes the tab', async () => {
+    const { ctx, chrome, listeners } = loadBackground({ seed: YT_BLOCKED });
+    expect(listeners.historyStateUpdated).toBeTypeOf('function');
+
+    listeners.historyStateUpdated({ frameId: 0, tabId: 7, url: OTHER_VIDEO_URL });
+    await Promise.resolve();
+
+    expect(chrome.tabs._messages).toContainEqual({
+      id: 7,
+      message: { action: 'urlChanged', url: OTHER_VIDEO_URL }
+    });
+    const recorded = await ctx.readNavContext(7);
+    expect(recorded.url).toBe(OTHER_VIDEO_URL);
+  });
+
+  it('ignores subframes and our own pages', async () => {
+    const { chrome, listeners } = loadBackground({ seed: YT_BLOCKED });
+    listeners.historyStateUpdated({ frameId: 1, tabId: 7, url: OTHER_VIDEO_URL });
+    listeners.historyStateUpdated({ frameId: 0, tabId: 7, url: 'chrome-extension://test/options.html' });
+    expect(chrome.tabs._messages).toHaveLength(0);
+  });
+});
+
+describe('leaving the page a pass was for', () => {
+  it('banks the minutes actually used under their own outcome', async () => {
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(12) });
+    await grantOnVideo(ctx);
+    chrome.storage._store.activeSessions['tab:7:youtube.com'].startTime = Date.now() - 4 * 60000;
+
+    await ctx.handleMessage(
+      { action: 'endSession', domain: 'youtube.com', reason: 'left_page' },
+      { tab: { id: 7 }, url: OTHER_VIDEO_URL }
+    );
+
+    const stats = await ctx.getStatsForDomain('youtube.com');
+    expect(stats.sessionsToday[0].outcome).toBe('left_page');
+    expect(Math.round(stats.minutesToday)).toBe(4);
+  });
+
+  // The drift screen is about to put a gate up in front of them; closing the
+  // tab from under it would look like a crash.
+  it('does not close the tab, unlike "finished"', async () => {
+    const removed = [];
+    const { ctx, chrome } = loadBackground({ seed: YT_BLOCKED, fetch: scopedGrantFetch(12) });
+    chrome.tabs.remove = (id) => removed.push(id);
+    await grantOnVideo(ctx);
+    await ctx.handleMessage(
+      { action: 'endSession', domain: 'youtube.com', reason: 'left_page' },
+      { tab: { id: 7 }, url: OTHER_VIDEO_URL }
+    );
+    expect(removed).toEqual([]);
+  });
+});
+
+// The gate page asks this before it decides whether it has anything to ask.
+// It cannot answer the scope half itself: coaching.html deliberately does not
+// load parts.js, so a pass-through decision made there would have to guess.
+describe('getSession answers where the pass applies, not just that it exists', () => {
+  const seedWith = (session) => ({
+    setupComplete: true,
+    blockedDomains: ['youtube.com'],
+    activeSessions: { 'tab:3:youtube.com': session }
+  });
+
+  it('says a scoped pass covers the page it was granted for', async () => {
+    const { ctx } = loadBackground({ seed: seedWith(scopedSession()) });
+    const res = await ctx.handleMessage(
+      { action: 'getSession', domain: 'youtube.com', url: VIDEO_URL }, tab(3, 'youtube.com')
+    );
+    expect(res.session).toBeTruthy();
+    expect(res.covers).toBe(true);
+  });
+
+  // Without this the gate page would hop them straight back to page one after
+  // they deliberately clicked through to page two.
+  it('says it does not cover a different page of the same site', async () => {
+    const { ctx } = loadBackground({ seed: seedWith(scopedSession()) });
+    const res = await ctx.handleMessage(
+      { action: 'getSession', domain: 'youtube.com', url: OTHER_VIDEO_URL }, tab(3, 'youtube.com')
+    );
+    expect(res.session).toBeTruthy();
+    expect(res.covers).toBe(false);
+  });
+
+  // Nowhere to check against is not a reason to let someone through.
+  it('will not vouch for a scoped pass when the destination is unknown', async () => {
+    const { ctx } = loadBackground({ seed: seedWith(scopedSession()) });
+    const res = await ctx.handleMessage({ action: 'getSession', domain: 'youtube.com' }, tab(3, 'youtube.com'));
+    expect(res.covers).toBe(false);
+  });
+
+  // The unchanged case: a caller that sends no url and a pass with no scope
+  // sees exactly what it saw before any of this existed.
+  it('covers everything for a pass with no scope, url or no url', async () => {
+    const { ctx } = loadBackground({
+      seed: seedWith({ domain: 'youtube.com', startTime: Date.now(), intervalMinutes: 10 })
+    });
+    const bare = await ctx.handleMessage({ action: 'getSession', domain: 'youtube.com' }, tab(3, 'youtube.com'));
+    const anywhere = await ctx.handleMessage(
+      { action: 'getSession', domain: 'youtube.com', url: OTHER_VIDEO_URL }, tab(3, 'youtube.com')
+    );
+    expect(bare.covers).toBe(true);
+    expect(anywhere.covers).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part rules: which SECTIONS of a blocked site are blocked.
+//
+// The rule lives on the limits entry (`scope` + `parts`) and every verdict in
+// this file comes from parts.js's resolvePartVerdict — these assertions are
+// about the four places the worker has to ASK it, and about what happens when
+// it is never asked. Three of the four fail open if the call is missing: the
+// page would gate that should not, the backstop would navigate a page the user
+// is allowed to be on, and a redirect rule would catch a section that was
+// explicitly left open.
+// ---------------------------------------------------------------------------
+
+describe('part rules in the worker', () => {
+  const ONLY_REELS = () => ({
+    ...CONFIGURED,
+    setupComplete: true,
+    blockedDomains: ['instagram.com'],
+    domainLimits: { 'instagram.com': { maxGrants: 3, maxMinutes: 45, scope: 'only', parts: ['instagram:reels'] } }
+  });
+
+  describe('checkPageMatch', () => {
+    it('does not gate an address the rule leaves open, and says why not', async () => {
+      const { ctx } = loadBackground({ seed: ONLY_REELS() });
+      const res = await ctx.checkPageMatch('www.instagram.com', 3, null, 'https://www.instagram.com/direct/inbox/');
+      expect(res.isBlocked).toBe(false);
+      // The host is still on the blocklist, and the page has to know that: it
+      // is one pushState away from a part that IS blocked.
+      expect(res.matchedDomain).toBe('instagram.com');
+      expect(res.partRule).toEqual({ scope: 'only', parts: ['instagram:reels'] });
+      expect(res.partId).toBe(null);
+    });
+
+    it('gates the part the rule names, and names it back', async () => {
+      const { ctx } = loadBackground({ seed: ONLY_REELS() });
+      const res = await ctx.checkPageMatch('www.instagram.com', 3, null, 'https://www.instagram.com/reels/abc/');
+      expect(res.isBlocked).toBe(true);
+      expect(res.partId).toBe('instagram:reels');
+    });
+
+    // Which of the two addresses a message carries is authoritative, and why
+    // the answer is different within an origin and across one.
+    describe('whose account of the address is used', () => {
+      it('takes the message\'s address within the sender\'s own origin', async () => {
+        const { ctx } = loadBackground({ seed: ONLY_REELS() });
+        // Chrome fills sender.url from the document the content script was
+        // INJECTED into, and a pushState re-injects nothing — so on an SPA it
+        // still names the page the user left, minutes later. Inside one origin
+        // the message is the content script reading window.location.href in the
+        // document the browser already vouched for, and it is the fresher fact.
+        // Without this, the whole SPA half of part rules is decided about the
+        // wrong page: tests/smoke/gate.smoke.mjs catches it and nothing else can.
+        const res = await ctx.handleMessage(
+          { action: 'checkPageMatch', host: 'www.instagram.com', url: 'https://www.instagram.com/reels/abc/' },
+          { tab: { id: 3 }, url: 'https://www.instagram.com/direct/' }
+        );
+        expect(res.isBlocked).toBe(true);
+        expect(res.partId).toBe('instagram:reels');
+      });
+
+      it('refuses an address from another origin and keeps the sender\'s', async () => {
+        const { ctx } = loadBackground({ seed: ONLY_REELS() });
+        // The forgery this guards against: a page claiming to be somewhere
+        // else entirely so that no rule of ours applies to it.
+        const res = await ctx.handleMessage(
+          { action: 'checkPageMatch', host: 'www.instagram.com', url: 'https://example.com/harmless' },
+          { tab: { id: 3 }, url: 'https://www.instagram.com/reels/abc/' }
+        );
+        expect(res.isBlocked).toBe(true);
+        expect(res.partId).toBe('instagram:reels');
+      });
+
+      it('falls back to the message when the runtime populates no sender', async () => {
+        const { ctx } = loadBackground({ seed: ONLY_REELS() });
+        // The native ports (Android, iOS) send no sender URL at all.
+        const res = await ctx.handleMessage(
+          { action: 'checkPageMatch', host: 'www.instagram.com', url: 'https://www.instagram.com/reels/abc/' },
+          {}
+        );
+        expect(res.isBlocked).toBe(true);
+      });
+    });
+
+    it('carries no part rule for a target that has none', async () => {
+      const { ctx } = loadBackground({
+        seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] }
+      });
+      const res = await ctx.checkPageMatch('www.instagram.com', 3, null, 'https://www.instagram.com/direct/');
+      expect(res.isBlocked).toBe(true);
+      expect(res.partRule).toBe(null);
+    });
+
+    it('gates everything when the stored rule is malformed', async () => {
+      const { ctx } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { scope: 'only', parts: [{ nope: true }, 17] } }
+        }
+      });
+      const res = await ctx.checkPageMatch('www.instagram.com', 3, null, 'https://www.instagram.com/direct/');
+      expect(res.isBlocked).toBe(true);
+    });
+  });
+
+  describe('the gate backstop', () => {
+    const withTab = (chrome, id, url) => { chrome.tabs._byId[id] = { id, url }; };
+
+    // Load-bearing rather than defensive. An allowed page never calls
+    // markHandled(), because there is nothing to handle — so without this
+    // check the backstop reads "no overlay" as "the overlay failed" and
+    // navigates every allowed page to the coach three seconds in.
+    it('stands down on an address the rule leaves open', async () => {
+      const { ctx, chrome } = loadBackground({ seed: ONLY_REELS() });
+      const url = 'https://www.instagram.com/direct/inbox/';
+      withTab(chrome, 4, url);
+      await ctx.enforceGateBackstop(4, url);
+      expect(chrome.tabs._updates).toHaveLength(0);
+    });
+
+    it('still fires on the part the rule names', async () => {
+      const { ctx, chrome } = loadBackground({ seed: ONLY_REELS() });
+      const url = 'https://www.instagram.com/reels/abc/';
+      withTab(chrome, 4, url);
+      await ctx.enforceGateBackstop(4, url);
+      expect(chrome.tabs._updates).toHaveLength(1);
+    });
+  });
+
+  describe('domainsNeedingRedirect', () => {
+    // A urlFilter of ||instagram.com^ cannot see a path, so it would redirect
+    // the sections the user explicitly left open. The overlay takes the host
+    // over instead — which is exactly how Safari gates every site today.
+    it('drops a host that carries a part rule', async () => {
+      const { ctx } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com', 'reddit.com'],
+          domainLimits: { 'instagram.com': { scope: 'only', parts: ['instagram:reels'] } }
+        }
+      });
+      expect(await ctx.domainsNeedingRedirect()).toEqual(['reddit.com']);
+    });
+
+    // hasPartRule and resolvePartVerdict have to agree about the same entry,
+    // or the redirect and the overlay would disagree about the same page. An
+    // empty list gates everything, so the host keeps its rule.
+    it('keeps a host whose rule names nothing', async () => {
+      const { ctx } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { scope: 'only', parts: [] } }
+        }
+      });
+      expect(await ctx.domainsNeedingRedirect()).toEqual(['instagram.com']);
+    });
+  });
+
+  describe('saveSettings', () => {
+    // The bug this exists to prevent: a scope change writes only domainLimits,
+    // and which domains get a redirect rule now depends on it — so without the
+    // re-sync the rule would stay stale, and a rule that looks saved and is not
+    // is the worst state this page can be in.
+    //
+    // Arranged as a rule being REMOVED rather than added, because saveSettings
+    // no longer accepts the other direction: adding a carve-out leaves less of
+    // the site blocked, and every loosening of a part rule now goes through the
+    // coach (holdPartRuleDirection, and the suite below). The re-sync is the
+    // same code either way, and the direction that still comes through here is
+    // the one worth pinning.
+    it('re-syncs the blocking rules when only domainLimits changed', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } }
+        }
+      });
+      const dnr = statefulDnr(chrome);
+      await ctx.syncBlockingRules();
+      // A domain with a part rule carries no redirect: the content script has
+      // to see the address before anything can decide.
+      expect(dnr.redirectedDomains()).toEqual([]);
+
+      await ctx.saveSettings({
+        domainLimits: { 'instagram.com': { maxGrants: 3 } }
+      });
+      expect(dnr.redirectedDomains()).toEqual(['||instagram.com^']);
+    });
+
+    it('sanitises a part rule on its way in, and deletes one that names nothing', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          // The same rule already stored, so what is being tested here is the
+          // sanitiser and not the direction guard: an edit that resolves to the
+          // rule already in force is not a loosening.
+          domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } }
+        }
+      });
+      await ctx.saveSettings({
+        domainLimits: {
+          'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels', 'not a part id', 'instagram:reels'] },
+          'reddit.com': { maxGrants: 3, scope: 'wat', parts: ['reddit:home'] }
+        }
+      });
+      const stored = chrome.storage._store.domainLimits;
+      expect(stored['instagram.com'].parts).toEqual(['instagram:reels']);
+      // An unrecognised scope is no scope, so both keys go rather than being
+      // written as 'all' — an entry with no rule must stay byte-identical to
+      // what shipped before this feature existed.
+      expect('scope' in stored['reddit.com']).toBe(false);
+      expect('parts' in stored['reddit.com']).toBe(false);
+    });
+
+    it('leaves an entry with no part rule exactly as it was', async () => {
+      const { ctx, chrome } = loadBackground({ seed: { ...CONFIGURED, setupComplete: true } });
+      const entry = { maxGrants: 3, maxMinutes: 45, looseUntilMinutes: 10 };
+      await ctx.saveSettings({ domainLimits: { 'instagram.com': entry } });
+      expect(chrome.storage._store.domainLimits['instagram.com']).toEqual(entry);
+    });
+  });
+
+  // Which direction a part rule may move through the two whole-key writers.
+  //
+  // The options page runs this same test (partEditIsLoosening) before it
+  // decides whether to save or to open the coach gate — and until this suite
+  // existed that was the ONLY place it ran. saveSettings wrote whatever map it
+  // was handed, so one runtime message from the extension's own devtools
+  // console opened whatever the user liked. The gate on widening a rule has to
+  // be a rule at this end, for the reason the leaveDelayMinutes clamp states
+  // outright: "the only caller is careful" is how a guarded field stops being
+  // guarded.
+  describe('the direction a part rule may move through saveSettings', () => {
+    const SEED = (extra = {}) => ({
+      ...CONFIGURED,
+      setupComplete: true,
+      blockedDomains: ['instagram.com'],
+      blockedApps: ['com.instagram.android'],
+      ...extra
+    });
+
+    it('refuses a first carve-out in a site that was blocked whole', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3, maxMinutes: 45 } } })
+      });
+      await ctx.saveSettings({
+        domainLimits: { 'instagram.com': { maxGrants: 3, maxMinutes: 45, scope: 'only', parts: ['instagram:dms'] } }
+      });
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      // Both keys gone, not written as 'all': an entry with no rule stays
+      // byte-identical to what shipped before the feature existed.
+      expect('scope' in entry).toBe(false);
+      expect('parts' in entry).toBe(false);
+      // ...and the rest of the entry still lands. Only the rule is held back,
+      // because one save carries the whole map and refusing it outright would
+      // throw away unrelated edits made in the same breath.
+      expect(entry.maxMinutes).toBe(45);
+    });
+
+    it('refuses a wider except-list, and keeps the stored one', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ appLimits: { 'com.instagram.android': { maxGrants: 3, scope: 'except', parts: ['instagram:dms'] } } })
+      });
+      await ctx.saveSettings({
+        appLimits: {
+          'com.instagram.android': { maxGrants: 3, scope: 'except', parts: ['instagram:dms', 'instagram:reels'] }
+        }
+      });
+      expect(chrome.storage._store.appLimits['com.instagram.android'].parts).toEqual(['instagram:dms']);
+    });
+
+    it('refuses a part dropped from an only-list', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels', 'instagram:explore'] } } })
+      });
+      await ctx.saveSettings({
+        domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } }
+      });
+      expect(chrome.storage._store.domainLimits['instagram.com'].parts)
+        .toEqual(['instagram:reels', 'instagram:explore']);
+    });
+
+    // The mirror, so this is a direction check and not a refusal to write.
+    it('still takes a part ADDED to an only-list, which blocks more', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } } })
+      });
+      await ctx.saveSettings({
+        domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels', 'instagram:explore'] } }
+      });
+      expect(chrome.storage._store.domainLimits['instagram.com'].parts)
+        .toEqual(['instagram:reels', 'instagram:explore']);
+    });
+
+    it('still takes a return to "all of it", which blocks everything', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } } })
+      });
+      await ctx.saveSettings({ domainLimits: { 'instagram.com': { maxGrants: 3 } } });
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      expect('scope' in entry).toBe(false);
+      expect('parts' in entry).toBe(false);
+    });
+
+    // 'only' and 'except' cannot be compared by list membership — the same ids
+    // mean opposite things on either side of the switch — so parts.js answers
+    // "unprovable", and unprovable has to mean refused here.
+    it('refuses a switch between the two scopes', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } } })
+      });
+      await ctx.saveSettings({
+        domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'except', parts: ['instagram:reels'] } }
+      });
+      expect(chrome.storage._store.domainLimits['instagram.com'].scope).toBe('only');
+    });
+
+    // The second whole-key writer. Finishing the wizard again must not be the
+    // way around a rule the coach refused an hour ago.
+    it('holds the same line through saveSetup', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3 } } })
+      });
+      await ctx.handleMessage({
+        action: 'saveSetup',
+        config: {
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'except', parts: ['instagram:reels'] } }
+        }
+      }, EXT_PAGE);
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      expect('scope' in entry).toBe(false);
+      expect('parts' in entry).toBe(false);
+    });
+
+    // The coach-approved path is the one thing that can widen a rule, and it
+    // does not come through saveSettings at all — otherwise approval would
+    // mean nothing.
+    it('leaves the approved path alone', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: SEED({ domainLimits: { 'instagram.com': { maxGrants: 3 } } })
+      });
+      await ctx.applySettingChange({
+        changeType: 'narrow_block_scope',
+        domain: 'instagram.com',
+        newValue: { scope: 'only', parts: ['instagram:dms'] }
+      });
+      expect(chrome.storage._store.domainLimits['instagram.com'].parts).toEqual(['instagram:dms']);
+    });
+  });
+
+  // Neither writer is reachable from a web page today — a page cannot send us
+  // a runtime message at all — and both carry the check anyway. Every other
+  // privileged action in handleMessage has one, and the asymmetry was the only
+  // thing that made an unguarded whole-config write look deliberate: one
+  // message with { blockedDomains: [] } and the product is off.
+  describe('the whole-config writers refuse a content sender', () => {
+    const CONTENT = { url: 'https://instagram.com/', tab: { id: 4 } };
+
+    it('refuses saveSettings, and changes nothing', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] }
+      });
+      const res = await ctx.handleMessage({ action: 'saveSettings', config: { blockedDomains: [] } }, CONTENT);
+      expect(res.error).toBeTruthy();
+      expect(chrome.storage._store.blockedDomains).toEqual(['instagram.com']);
+    });
+
+    it('refuses saveSetup, and changes nothing', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] }
+      });
+      const res = await ctx.handleMessage({ action: 'saveSetup', config: { blockedDomains: [] } }, CONTENT);
+      expect(res.error).toBeTruthy();
+      expect(chrome.storage._store.blockedDomains).toEqual(['instagram.com']);
+    });
+
+    // ...while our own pages and the native hosts still write, which is the
+    // only reason the settings page works at all. The native shape matters on
+    // its own: on Android and iOS EVERY message from our settings page arrives
+    // with an empty sender.
+    it('still lets an extension page and a native host through', async () => {
+      for (const sender of [EXT_PAGE, NATIVE]) {
+        const { ctx, chrome } = loadBackground({
+          seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] }
+        });
+        await ctx.handleMessage({ action: 'saveSettings', config: { blockedDomains: ['reddit.com'] } }, sender);
+        expect(chrome.storage._store.blockedDomains).toEqual(['reddit.com']);
+      }
+    });
+  });
+
+  describe('applySettingChange', () => {
+    const SEED = () => ({
+      ...CONFIGURED,
+      setupComplete: true,
+      blockedDomains: ['instagram.com'],
+      blockedApps: ['com.instagram.android'],
+      domainLimits: { 'instagram.com': { maxGrants: 3, maxMinutes: 45 } },
+      appLimits: { 'com.instagram.android': { maxGrants: 3 } }
+    });
+
+    it('writes the scope and the parts on a site, and re-syncs the rules', async () => {
+      const { ctx, chrome } = loadBackground({ seed: SEED() });
+      const dnr = statefulDnr(chrome);
+      await ctx.syncBlockingRules();
+      expect(dnr.redirectedDomains()).toEqual(['||instagram.com^']);
+
+      const res = await ctx.applySettingChange({
+        changeType: 'narrow_block_scope',
+        domain: 'instagram.com',
+        newValue: { scope: 'only', parts: ['instagram:reels'] }
+      });
+      expect(res.parts).toEqual(['instagram:reels']);
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      expect(entry.scope).toBe('only');
+      expect(entry.parts).toEqual(['instagram:reels']);
+      // Nothing else on the entry moves.
+      expect(entry.maxMinutes).toBe(45);
+      expect(dnr.redirectedDomains()).toEqual([]);
+    });
+
+    it('deletes both keys when the new rule resolves to no rule at all', async () => {
+      const { ctx, chrome } = loadBackground({
+        seed: {
+          ...SEED(),
+          domainLimits: { 'instagram.com': { maxGrants: 3, scope: 'only', parts: ['instagram:reels'] } }
+        }
+      });
+      await ctx.applySettingChange({
+        changeType: 'narrow_block_scope',
+        domain: 'instagram.com',
+        newValue: { scope: 'all', parts: [] }
+      });
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      expect('scope' in entry).toBe(false);
+      expect('parts' in entry).toBe(false);
+      expect(entry.maxGrants).toBe(3);
+    });
+
+    it('sanitises a hostile value rather than storing it', async () => {
+      const { ctx, chrome } = loadBackground({ seed: SEED() });
+      await ctx.applySettingChange({
+        changeType: 'narrow_block_scope',
+        domain: 'instagram.com',
+        newValue: { scope: 'only', parts: Array.from({ length: 40 }, (_, i) => `path:/p${i}/*`).concat(['../etc']) }
+      });
+      const entry = chrome.storage._store.domainLimits['instagram.com'];
+      expect(entry.parts).toHaveLength(20);
+      expect(entry.parts.every(p => p.startsWith('path:/p'))).toBe(true);
+    });
+
+    it('writes an app rule to appLimits and leaves the DNR rules alone', async () => {
+      const { ctx, chrome } = loadBackground({ seed: SEED() });
+      const dnr = statefulDnr(chrome);
+      await ctx.syncBlockingRules();
+      await ctx.applySettingChange({
+        changeType: 'narrow_app_block_scope',
+        domain: 'com.instagram.android',
+        newValue: { scope: 'except', parts: ['instagram:dms'] }
+      });
+      expect(chrome.storage._store.appLimits['com.instagram.android'].scope).toBe('except');
+      // An app target has no redirect rule to re-sync, and the site's is
+      // untouched by an app-side change.
+      expect(dnr.redirectedDomains()).toEqual(['||instagram.com^']);
+    });
+
+    // The app change types are listed once (APP_CHANGE_TYPES), because several
+    // places have to agree about which targets are apps: page context is
+    // meaningless for one, the display name comes from appLabels, and the app
+    // context block replaces the page one. Asserted through the consequence —
+    // a package name that reached the coach as a hostname would be quoted back
+    // to the user as one.
+    it('is treated as an app target by the coach, not as a hostname', async () => {
+      const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+      const { ctx } = loadBackground({
+        seed: { ...SEED(), appLabels: { 'com.instagram.android': 'Instagram' } },
+        fetch
+      });
+      await ctx.handleMessage({
+        action: 'chat',
+        mode: 'settings_gate',
+        domain: 'com.instagram.android',
+        changeType: 'narrow_app_block_scope',
+        currentValue: { scope: 'all', parts: [] },
+        newValue: { scope: 'except', parts: ['instagram:dms'] },
+        userMessage: 'please'
+      }, EXT_PAGE);
+      const system = systemPromptOf(fetch);
+      expect(system).toContain('the Instagram app');
+      expect(system).not.toContain('com.instagram.android');
+    });
+  });
+
+  describe('what the coach is told', () => {
+    it('names the part they are on and the parts they left open', async () => {
+      const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+      const { ctx } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { scope: 'only', parts: ['instagram:reels', 'instagram:explore'] } }
+        },
+        fetch
+      });
+      await ctx.handleMessage({
+        action: 'chat',
+        mode: 'gate',
+        domain: 'instagram.com',
+        userMessage: 'hi',
+        pageContext: { url: 'https://www.instagram.com/reels/abc/', contentType: 'Instagram Reel' }
+      }, tab(3));
+      const system = systemPromptOf(fetch);
+      expect(system).toContain('they block only these parts: Reels, Explore');
+      expect(system).toContain('Right now they are on: Reels');
+    });
+
+    it('says nothing about parts for a target with no rule', async () => {
+      const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+      const { ctx } = loadBackground({
+        seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] },
+        fetch
+      });
+      await ctx.handleMessage({
+        action: 'chat',
+        mode: 'gate',
+        domain: 'instagram.com',
+        userMessage: 'hi',
+        pageContext: { url: 'https://www.instagram.com/reels/abc/' }
+      }, tab(3));
+      expect(systemPromptOf(fetch)).not.toContain('Which part of the site they are on');
+    });
+
+    // {{current_value}} is a token a user's own coach instructions may use, and
+    // an object rendered through it reads as "[object Object]" — the coach
+    // quoting a JavaScript artefact at the exact moment it asks them to
+    // justify a change.
+    it('hands the settings gate two sentences, never two objects', async () => {
+      const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+      const { ctx } = loadBackground({
+        seed: {
+          ...CONFIGURED,
+          setupComplete: true,
+          blockedDomains: ['instagram.com'],
+          domainLimits: { 'instagram.com': { maxGrants: 3 } }
+        },
+        fetch
+      });
+      await ctx.handleMessage({
+        action: 'chat',
+        mode: 'settings_gate',
+        domain: 'instagram.com',
+        changeType: 'narrow_block_scope',
+        currentValue: { scope: 'all', parts: [] },
+        newValue: { scope: 'only', parts: ['instagram:reels'] },
+        userMessage: 'please'
+      }, EXT_PAGE);
+      const system = systemPromptOf(fetch);
+      expect(system).not.toContain('[object Object]');
+      expect(system).toContain('Right now: all of instagram.com');
+      expect(system).toContain('They want: only Reels on instagram.com');
+    });
+  });
+});
+
+// ===========================================================================
+// Leaving Intention (WP9)
+// ===========================================================================
+//
+// Two halves, tested separately because they fail differently. The pure
+// half — isRemovalSurfaceUrl and leaveInterposeAllowed — is the whole policy
+// of the feature written down; the stateful half is what the browser and the
+// options page can actually make happen.
+//
+// The property every one of these is ultimately protecting: there is always a
+// working way out, and nothing here can loop.
+
+describe('isRemovalSurfaceUrl', () => {
+  const { ctx } = loadBackground();
+
+  it.each([
+    ['chrome://extensions'],
+    ['chrome://extensions/'],
+    ['chrome://extensions/?id=abcdef'],
+    ['chrome://extensions/shortcuts'],
+    ['chrome://Extensions'],
+    ['edge://extensions'],
+    ['brave://extensions/'],
+    ['about:addons'],
+    ['about:addons#detail/something']
+  ])('recognises %s', (url) => {
+    expect(ctx.isRemovalSurfaceUrl(url)).toBe(true);
+  });
+
+  // The prefix cases are the ones a naive startsWith() gets wrong.
+  // chrome://extensions-internals is a debugging page with nothing to do with
+  // removal, and the two https ones are a hostile page trying to make the
+  // worker open a tab by putting our own string in its address.
+  it.each([
+    ['chrome://settings'],
+    ['chrome://extensions-internals'],
+    ['chrome://extensionsomething'],
+    ['about:addonsfoo'],
+    ['https://example.com/chrome://extensions'],
+    ['https://chrome.extensions.example.com/'],
+    [''],
+    [undefined],
+    [null],
+    [{}],
+    [42]
+  ])('refuses %s', (url) => {
+    expect(ctx.isRemovalSurfaceUrl(url)).toBe(false);
+  });
+});
+
+describe('leaveInterposeAllowed', () => {
+  const { ctx } = loadBackground();
+  const NOW = 1_800_000_000_000;
+  const ready = { setupComplete: true, blockedDomains: ['instagram.com'] };
+
+  it('allows an ordinary first visit', () => {
+    expect(ctx.leaveInterposeAllowed(ready, NOW)).toBe(true);
+  });
+
+  it.each([
+    [{ ...ready, setupComplete: false }, 'setup was never finished'],
+    [{ ...ready, blockedDomains: [] }, 'the blocklist is empty'],
+    [{ ...ready, blockedDomains: 'instagram.com' }, 'the blocklist is not even a list'],
+    [null, 'there is no state at all'],
+    [undefined, 'the read came back empty']
+  ])('stays quiet when %#: %s', (state) => {
+    expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(false);
+  });
+
+  // THE anti-loop property, and the one thing to point a store reviewer at: a
+  // decline silences the interposition exactly as hard as an approval does.
+  // Talk to the coach, decide to stay, go back to chrome://extensions for
+  // whatever you actually opened it for — and Intention says nothing.
+  it.each([['approved'], ['declined'], ['cancelled'], ['anyway']])(
+    'stays quiet inside a stand-down written with reason "%s"', (reason) => {
+      const state = { ...ready, leaveStandDown: { until: NOW + 60_000, reason } };
+      expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(false);
+    });
+
+  it('speaks again once the stand-down has lapsed', () => {
+    const state = { ...ready, leaveStandDown: { until: NOW - 1, reason: 'declined' } };
+    expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(true);
+  });
+
+  // A stand-down can never suppress for longer than its own length. Without
+  // the cap, a clock that jumped forward once — or a hand-edited value —
+  // could write a silence lasting years, and the user would have no way to
+  // tell why the feature had stopped working.
+  it('ignores a stand-down further out than a stand-down can possibly be', () => {
+    const state = { ...ready, leaveStandDown: { until: NOW + ctx.LEAVE_STAND_DOWN_MS + 1, reason: 'declined' } };
+    expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(true);
+  });
+
+  it('stays quiet inside the plain debounce', () => {
+    expect(ctx.leaveInterposeAllowed({ ...ready, leaveInterposedAt: NOW - 1000 }, NOW)).toBe(false);
+    expect(ctx.leaveInterposeAllowed({ ...ready, leaveInterposedAt: NOW - ctx.LEAVE_INTERPOSE_DEBOUNCE_MS - 1 }, NOW)).toBe(true);
+  });
+
+  // A timestamp in the future means the clock moved backwards. Treating it as
+  // a live debounce would silence the feature until the clock caught up.
+  it('does not let a future timestamp silence it', () => {
+    expect(ctx.leaveInterposeAllowed({ ...ready, leaveInterposedAt: NOW + 86_400_000 }, NOW)).toBe(true);
+  });
+
+  // They already asked and the coach already agreed. Opening the conversation
+  // again would be asking somebody to re-justify a decision we accepted.
+  it('stays quiet for the whole life of a pending request', () => {
+    const state = { ...ready, leaveRequest: { requestedAt: NOW, availableAt: NOW + 86_400_000, delayMinutes: 1440 } };
+    expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(false);
+  });
+
+  it('and after that request matures, because the answer was still yes', () => {
+    const state = { ...ready, leaveRequest: { requestedAt: NOW - 90_000_000, availableAt: NOW - 1000, delayMinutes: 1440 } };
+    expect(ctx.leaveInterposeAllowed(state, NOW)).toBe(false);
+  });
+});
+
+describe('the chrome://extensions interposition', () => {
+  const seeded = (extra = {}) => loadBackground({
+    seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], ...extra }
+  });
+
+  // The load-bearing assumption of the whole browser half — that tabs.onUpdated
+  // is offered a populated URL for a chrome:// page — cannot be proved here;
+  // that is what tests/smoke/leaving.smoke.mjs exists for. What CAN be proved
+  // here is everything that happens once it is.
+  it('opens exactly one tab, beside the extensions page', async () => {
+    const { ctx, chrome, listeners } = seeded();
+    expect(typeof listeners.tabUpdated).toBe('function');
+    listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+    await vi.waitFor(() => expect(chrome.tabs._creates.length).toBe(1));
+    expect(chrome.tabs._creates[0].url).toBe('chrome-extension://test/options.html?leave=1');
+    void ctx;
+  });
+
+  // The Chrome Web Store's "must be easily reversible" clause lives here. The
+  // user may well have opened that page to manage a DIFFERENT extension — no
+  // API tells us whose row they are looking at — so taking the page away from
+  // them is not ours to do.
+  it('never navigates or closes the extensions tab', async () => {
+    const { chrome, listeners } = seeded();
+    listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+    await vi.waitFor(() => expect(chrome.tabs._creates.length).toBe(1));
+    expect(chrome.tabs._updates.filter(u => u.id === 7)).toEqual([]);
+  });
+
+  it('says nothing at all about an unrelated chrome:// page', async () => {
+    const { chrome, listeners } = seeded();
+    listeners.tabUpdated(7, { url: 'chrome://settings/' }, { id: 7, url: 'chrome://settings/' });
+    await new Promise(r => setTimeout(r, 20));
+    expect(chrome.tabs._creates).toEqual([]);
+  });
+
+  it('says nothing before setup, or with an empty blocklist', async () => {
+    for (const seed of [{ setupComplete: false }, { blockedDomains: [] }]) {
+      const { chrome, listeners } = seeded(seed);
+      listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+      await new Promise(r => setTimeout(r, 20));
+      expect(chrome.tabs._creates).toEqual([]);
+    }
+  });
+
+  it('opens nothing on a second visit inside the debounce', async () => {
+    const { chrome, listeners } = seeded();
+    listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+    await vi.waitFor(() => expect(chrome.tabs._creates.length).toBe(1));
+    listeners.tabUpdated(8, { url: 'chrome://extensions/' }, { id: 8, url: 'chrome://extensions/' });
+    await new Promise(r => setTimeout(r, 20));
+    expect(chrome.tabs._creates.length).toBe(1);
+  });
+
+  // tabs.onUpdated fires more than once for one visit (the url change, then
+  // status 'complete'). Both would otherwise read the stored debounce before
+  // either had written it, and the user would get two tabs for one page load.
+  it('opens one tab for the two events a single navigation raises', async () => {
+    const { chrome, listeners } = seeded();
+    listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+    listeners.tabUpdated(7, { status: 'complete' }, { id: 7, url: 'chrome://extensions/' });
+    await new Promise(r => setTimeout(r, 30));
+    expect(chrome.tabs._creates.length).toBe(1);
+  });
+
+  it('stays quiet inside a stand-down, including one written by a decline', async () => {
+    const { chrome, listeners } = seeded({
+      leaveStandDown: { until: Date.now() + 60_000, reason: 'declined' }
+    });
+    listeners.tabUpdated(7, { url: 'chrome://extensions/' }, { id: 7, url: 'chrome://extensions/' });
+    await new Promise(r => setTimeout(r, 20));
+    expect(chrome.tabs._creates).toEqual([]);
+  });
+
+  it('ignores an event that carries no navigation and no completion', async () => {
+    const { chrome, listeners } = seeded();
+    listeners.tabUpdated(7, { favIconUrl: 'x' }, { id: 7, url: 'chrome://extensions/' });
+    await new Promise(r => setTimeout(r, 20));
+    expect(chrome.tabs._creates).toEqual([]);
+  });
+});
+
+describe('the farewell page', () => {
+  it('is registered, and points away from our own backend', () => {
+    const { chrome } = loadBackground();
+    expect(chrome.runtime._uninstallURL).toMatch(/^https:\/\/github\.com\//);
+    // Pointing it at api.intention.* would make every removal a request the
+    // backend logs — an uninstall ping, which PRIVACY.md forbids.
+    expect(chrome.runtime._uninstallURL).not.toMatch(/intention\.maybeitssoftware/);
+    expect(chrome.runtime._uninstallURL).toContain('LEAVING.md');
+  });
+});
+
+describe("applySettingChange: the user's way out", () => {
+  const seeded = (extra = {}) => loadBackground({
+    seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], ...extra }
+  });
+
+  it('with no cool-off, clears the way now and writes a stand-down', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 0 });
+    const before = Date.now();
+    const result = await ctx.applySettingChange({ changeType: 'uninstall', domain: null });
+    expect(result.removalReady).toBe(true);
+    expect(result.delayMinutes).toBe(0);
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('approved');
+    expect(chrome.storage._store.leaveStandDown.until).toBeGreaterThanOrEqual(before + ctx.LEAVE_STAND_DOWN_MS);
+    expect(chrome.storage._store.leaveRequest).toBe(null);
+  });
+
+  it('with a cool-off, starts the clock and removes nothing', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 1440 });
+    const before = Date.now();
+    const result = await ctx.applySettingChange({ changeType: 'uninstall', domain: null });
+    expect(result.removalReady).toBe(false);
+    expect(result.availableAt).toBeGreaterThanOrEqual(before + 86_400_000);
+    expect(chrome.storage._store.leaveRequest.delayMinutes).toBe(1440);
+    // The blocklist is untouched. Approving a departure is not a teardown —
+    // Intention keeps working, unchanged, for the whole of the cool-off.
+    expect(chrome.storage._store.blockedDomains).toEqual(['instagram.com']);
+  });
+
+  // The design this came from wrote a stand-down only on the no-delay path.
+  // Writing one on both makes "every outcome of the leaving conversation
+  // writes a stand-down" a rule with no exceptions — much easier to state to
+  // a reviewer, and it can only ever add silence.
+  it('writes a stand-down on the delayed path too', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 60 });
+    await ctx.applySettingChange({ changeType: 'uninstall', domain: null });
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('approved');
+  });
+
+  it('snaps a corrupt stored delay DOWN before acting on it', async () => {
+    const { ctx } = seeded({ leaveDelayMinutes: 1439 });
+    const result = await ctx.applySettingChange({ changeType: 'uninstall', domain: null });
+    expect(result.delayMinutes).toBe(60);
+  });
+
+  it('shortens the cool-off when the new value is genuinely smaller', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 1440 });
+    const result = await ctx.applySettingChange({ changeType: 'decrease_leave_delay', newValue: 60 });
+    expect(result.leaveDelayMinutes).toBe(60);
+    expect(chrome.storage._store.leaveDelayMinutes).toBe(60);
+  });
+
+  // A "decrease" that raises the number would launder a free change through
+  // the gate; one equal to the current value would let the coach be talked
+  // into approving a no-op, which reads to the user as their cool-off having
+  // moved when nothing did.
+  it.each([[1440], [4320], [99999]])('refuses %i, which is not a decrease', async (newValue) => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 1440 });
+    expect(await ctx.applySettingChange({ changeType: 'decrease_leave_delay', newValue })).toBe(null);
+    expect(chrome.storage._store.leaveDelayMinutes).toBe(1440);
+  });
+
+  it('refuses a decrease when there is no cool-off to decrease', async () => {
+    const { ctx } = seeded({ leaveDelayMinutes: 0 });
+    expect(await ctx.applySettingChange({ changeType: 'decrease_leave_delay', newValue: 0 })).toBe(null);
+  });
+});
+
+describe('saveSettings guards the direction of the cool-off', () => {
+  const seeded = (extra = {}) => loadBackground({ seed: { ...CONFIGURED, ...extra } });
+
+  it('lets it be lengthened for free — that is a tightening', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 60 });
+    await ctx.saveSettings({ leaveDelayMinutes: 4320 });
+    expect(chrome.storage._store.leaveDelayMinutes).toBe(4320);
+  });
+
+  // The choke point, not a UI convention: every extension page can reach
+  // saveSettings, so without this the gate on shortening is decoration.
+  it('refuses to shorten it, whatever the caller asked for', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 1440 });
+    await ctx.saveSettings({ leaveDelayMinutes: 0 });
+    expect(chrome.storage._store.leaveDelayMinutes).toBe(1440);
+  });
+
+  it('and normalises whatever it does write', async () => {
+    const { ctx, chrome } = seeded({ leaveDelayMinutes: 0 });
+    await ctx.saveSettings({ leaveDelayMinutes: 4319 });
+    expect(chrome.storage._store.leaveDelayMinutes).toBe(1440);
+  });
+});
+
+describe('the leaving message actions', () => {
+  const seeded = (extra = {}) => loadBackground({
+    seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], ...extra }
+  });
+
+  // A page that could call beginLeave would buy fifteen minutes of silence
+  // from the interposition; one that could call completeRemoval would
+  // uninstall a self-control tool out from under its user without a word.
+  it.each([['getLeaveState'], ['beginLeave'], ['completeRemoval']])(
+    'refuses %s from a content script', async (action) => {
+      const { ctx, chrome } = seeded();
+      const result = await ctx.handleMessage({ action }, tab(3));
+      expect(result.error).toMatch(/Not allowed/);
+      expect(chrome.management._uninstallCalls).toEqual([]);
+      expect(chrome.storage._store.leaveStandDown).toBe(undefined);
+    });
+
+  it.each([['uninstall'], ['decrease_leave_delay']])(
+    'refuses applySettingChange(%s) from a content script', async (changeType) => {
+      const { ctx, chrome } = seeded({ leaveDelayMinutes: 1440 });
+      const result = await ctx.handleMessage({ action: 'applySettingChange', changeType, newValue: 0 }, tab(3));
+      expect(result.error).toMatch(/Not allowed/);
+      expect(chrome.storage._store.leaveDelayMinutes).toBe(1440);
+    });
+
+  // In coach mode the change has to be argued for, so the free path is shut.
+  // These two carry no domain, so it is the GLOBAL mode that decides.
+  it.each([['uninstall'], ['decrease_leave_delay']])(
+    'refuses the ungated %s while the global mode is coach', async (changeType) => {
+      const { ctx, chrome } = seeded({ blockingMode: 'coach', leaveDelayMinutes: 1440 });
+      const result = await ctx.handleMessage({ action: 'applySettingChange', changeType, newValue: 0 }, EXT_PAGE);
+      expect(result.error).toMatch(/requires the coach/);
+      expect(chrome.storage._store.leaveRequest).toBe(undefined);
+    });
+
+  it('allows it in simple mode, where there is no coach to convince', async () => {
+    const { ctx, chrome } = seeded({ blockingMode: 'simple', leaveDelayMinutes: 0 });
+    const result = await ctx.handleMessage({ action: 'applySettingChange', changeType: 'uninstall' }, EXT_PAGE);
+    expect(result.removalReady).toBe(true);
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('approved');
+  });
+
+  it('reports the state the settings card paints from', async () => {
+    const now = Date.now();
+    const { ctx } = seeded({
+      leaveDelayMinutes: 1440,
+      leaveRequest: { requestedAt: now - 1000, availableAt: now + 60_000, delayMinutes: 1440 }
+    });
+    const state = await ctx.handleMessage({ action: 'getLeaveState' }, EXT_PAGE);
+    expect(state.leaveDelayMinutes).toBe(1440);
+    expect(state.ready).toBe(false);
+    expect(state.canSelfUninstall).toBe(true);
+  });
+
+  it('calls a matured request ready', async () => {
+    const now = Date.now();
+    const { ctx } = seeded({ leaveRequest: { requestedAt: now - 90_000, availableAt: now - 1, delayMinutes: 60 } });
+    const state = await ctx.handleMessage({ action: 'getLeaveState' }, EXT_PAGE);
+    expect(state.ready).toBe(true);
+  });
+
+  // An unreadable request reads as "nobody has asked", which costs one more
+  // conversation. Reading it the other way would let a corrupt value hold the
+  // door open forever.
+  it.each([[{}], [{ availableAt: 'soon' }], [{ availableAt: 0 }], ['nonsense'], [42]])(
+    'treats the unreadable request %j as no request', async (leaveRequest) => {
+      const { ctx } = seeded({ leaveRequest });
+      const state = await ctx.handleMessage({ action: 'getLeaveState' }, EXT_PAGE);
+      expect(state.leaveRequest).toBe(null);
+      expect(state.ready).toBe(false);
+    });
+
+  it('records every outcome as a stand-down, including a decline', async () => {
+    for (const reason of ['approved', 'declined', 'cancelled', 'anyway']) {
+      const { ctx, chrome } = seeded();
+      const before = Date.now();
+      const result = await ctx.handleMessage({ action: 'beginLeave', reason }, EXT_PAGE);
+      expect(result.reason).toBe(reason);
+      expect(chrome.storage._store.leaveStandDown.reason).toBe(reason);
+      expect(chrome.storage._store.leaveStandDown.until).toBeGreaterThanOrEqual(before + ctx.LEAVE_STAND_DOWN_MS);
+    }
+  });
+
+  it('files an unrecognised outcome as a decline rather than storing it', async () => {
+    const { ctx, chrome } = seeded();
+    await ctx.handleMessage({ action: 'beginLeave', reason: 'sneaky' }, EXT_PAGE);
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('declined');
+  });
+
+  // The ordering is the point: if the user says no to the browser's own
+  // confirmation dialog, Intention is still running and must not greet them
+  // with the same conversation the moment they look at the page again.
+  it('writes the stand-down BEFORE it attempts the uninstall', async () => {
+    const { ctx, chrome } = seeded();
+    const result = await ctx.handleMessage({ action: 'completeRemoval' }, EXT_PAGE);
+    expect(result.ok).toBe(true);
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('anyway');
+    expect(chrome.management._uninstallCalls).toEqual([{ showConfirmDialog: true }]);
+  });
+
+  it('reports a declined confirmation dialog as a cancellation, not an error', async () => {
+    const { ctx, chrome } = seeded();
+    chrome.management.uninstallSelf = async () => { throw new Error('User cancelled uninstall'); };
+    const result = await ctx.handleMessage({ action: 'completeRemoval' }, EXT_PAGE);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('cancelled');
+    // Still stood down: they went as far as the dialog, and being asked again
+    // thirty seconds later would be the loop this feature must not become.
+    expect(chrome.storage._store.leaveStandDown.reason).toBe('anyway');
+  });
+
+  // uninstallSelf() would remove the SAFARI EXTENSION and leave the Intention
+  // app exactly where it was — technically a removal, not the one the button
+  // promises. The options page shows directions there instead.
+  it('will not self-uninstall on an Apple build', async () => {
+    const { ctx, chrome } = loadBackground({
+      seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'] },
+      userAgent: 'Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15'
+    });
+    expect((await ctx.handleMessage({ action: 'getLeaveState' }, EXT_PAGE)).canSelfUninstall).toBe(false);
+    const result = await ctx.handleMessage({ action: 'completeRemoval' }, EXT_PAGE);
+    expect(result).toEqual({ ok: false, reason: 'unsupported' });
+    expect(chrome.management._uninstallCalls).toEqual([]);
+  });
+});
+
+describe('what the leaving conversation tells the coach', () => {
+  it('hands it the aggregate picture and the removal tool', async () => {
+    const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+    const { ctx } = loadBackground({
+      seed: {
+        ...CONFIGURED,
+        setupComplete: true,
+        blockedDomains: ['instagram.com', 'reddit.com'],
+        blockedApps: ['com.instagram.android'],
+        leaveDelayMinutes: 1440,
+        setupCompletedAt: Date.now() - 10 * 86_400_000
+      },
+      fetch
+    });
+    await ctx.handleMessage({
+      action: 'chat', mode: 'settings_gate', changeType: 'uninstall', userMessage: 'I am done'
+    }, EXT_PAGE);
+    const system = systemPromptOf(fetch);
+    expect(system).toContain('2 sites and 1 app');
+    expect(system).toContain('10 days ago');
+    expect(system).toContain('The cool-off they put on leaving: 24 hours.');
+    expect(system).not.toContain('Your default answer is NO');
+    // The tool description carries half the stance, so it has to be the
+    // stance-free one or the branch above is undone from the outside.
+    const tools = JSON.parse(fetch.calls.at(-1).init.body).tools;
+    expect(tools).toHaveLength(1);
+    expect(tools[0].name).toBe('approve_setting_change');
+    expect(tools[0].description).not.toContain('default answer is NO');
+  });
+
+  // Anyone who set Intention up before setupCompletedAt existed has no such
+  // key, and the earliest day they have usage for is the same answer reached
+  // from data that was already on the device.
+  it('falls back to the earliest day in the stats for an older install', async () => {
+    const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+    const old = new Date(Date.now() - 30 * 86_400_000);
+    const key = `${old.getFullYear()}-${String(old.getMonth() + 1).padStart(2, '0')}-${String(old.getDate()).padStart(2, '0')}`;
+    const { ctx } = loadBackground({
+      seed: {
+        ...CONFIGURED,
+        setupComplete: true,
+        blockedDomains: ['instagram.com'],
+        dailyStats: { [key]: { 'instagram.com': { minutes: 5 } } }
+      },
+      fetch
+    });
+    await ctx.handleMessage({
+      action: 'chat', mode: 'settings_gate', changeType: 'uninstall', userMessage: 'bye'
+    }, EXT_PAGE);
+    expect(systemPromptOf(fetch)).toContain('30 days ago');
+  });
+
+  it('keeps the ordinary sceptical tool for shortening the cool-off', async () => {
+    const fetch = makeMockFetch({ content: [{ type: 'text', text: 'ok' }] });
+    const { ctx } = loadBackground({
+      seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], leaveDelayMinutes: 1440 },
+      fetch
+    });
+    await ctx.handleMessage({
+      action: 'chat', mode: 'settings_gate', changeType: 'decrease_leave_delay',
+      currentValue: 1440, newValue: 60, userMessage: 'please'
+    }, EXT_PAGE);
+    const system = systemPromptOf(fetch);
+    expect(system).toContain('Your default answer is NO');
+    expect(system).toContain('from 24 hours to an hour');
+    expect(JSON.parse(fetch.calls.at(-1).init.body).tools[0].description).toContain('default answer is NO');
+  });
+
+  it('closes with the cool-off in the acceptance line, not a farewell', async () => {
+    const fetch = makeMockFetch({
+      content: [{ type: 'tool_use', id: 't1', name: 'approve_setting_change', input: { reason: 'done with it' } }]
+    });
+    const { ctx } = loadBackground({
+      seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], leaveDelayMinutes: 1440 },
+      fetch
+    });
+    const result = await ctx.handleMessage({
+      action: 'chat', mode: 'settings_gate', changeType: 'uninstall', userMessage: 'I am done'
+    }, EXT_PAGE);
+    expect(result.approved).toBe(true);
+    expect(result.assistantText).toContain('Your 24 hours starts now');
+  });
+
+  it('and with a farewell when there is no cool-off', async () => {
+    const fetch = makeMockFetch({
+      content: [{ type: 'tool_use', id: 't1', name: 'approve_setting_change', input: { reason: 'done' } }]
+    });
+    const { ctx } = loadBackground({
+      seed: { ...CONFIGURED, setupComplete: true, blockedDomains: ['instagram.com'], leaveDelayMinutes: 0 },
+      fetch
+    });
+    const result = await ctx.handleMessage({
+      action: 'chat', mode: 'settings_gate', changeType: 'uninstall', userMessage: 'I am done'
+    }, EXT_PAGE);
+    expect(result.assistantText).toContain("I've stepped out of the way");
+  });
+});
+
+describe('the config the leaving card reads', () => {
+  it('carries the cool-off and when setup happened', async () => {
+    const { ctx } = loadBackground({ seed: { setupComplete: true, leaveDelayMinutes: 1439, setupCompletedAt: 12345 } });
+    const config = await ctx.handleMessage({ action: 'getConfig' }, EXT_PAGE);
+    // Normalised on the way OUT too, so a drifted value paints as the rung
+    // below it rather than as no choice selected at all.
+    expect(config.leaveDelayMinutes).toBe(60);
+    expect(config.setupCompletedAt).toBe(12345);
+  });
+
+  it('stamps the setup date on the way through the wizard', async () => {
+    const { ctx, chrome } = loadBackground();
+    const before = Date.now();
+    await ctx.handleMessage({ action: 'saveSetup', config: { blockedDomains: ['instagram.com'] } }, EXT_PAGE);
+    expect(chrome.storage._store.setupCompletedAt).toBeGreaterThanOrEqual(before);
   });
 });

@@ -285,6 +285,35 @@ const OVERLAY_CSS = `
   padding: 6px 12px;
 }
 
+/* The drift screen: they are still inside a page-scoped pass, but this is not
+   the page it was for. Deliberately styled as a continuation of the pass and
+   not as an error - no danger hue anywhere - because nothing has gone wrong:
+   the block came back exactly when they were told it would. */
+#intention-root .int-drift-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  margin-top: 6px;
+}
+
+/* Coarse pointers get the 44px target without the painted control growing:
+   the button keeps its size, the box around it does not. */
+@media (pointer: coarse) {
+  #intention-root .int-drift-actions button {
+    min-height: 44px;
+  }
+}
+
+#intention-root .int-drift-note {
+  margin: 26px 0 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
 /* Walk-away moment: one full-screen line before the page goes. */
 #intention-root .int-walkaway {
   position: fixed;
@@ -319,9 +348,25 @@ const OVERLAY_CSS = `
   font-family: 'Arvo', Georgia, 'Times New Roman', serif;
   font-size: 13px;
   font-weight: 500;
+  line-height: 1.35;
   box-shadow: 0 2px 14px var(--scrim);
   border: 1px solid var(--border);
   pointer-events: auto;
+}
+
+/* What a page-scoped pass is FOR, above the clock. The micro-label: 10px,
+   bold, uppercase, 0.15em tracking, muted - the same device the gate's own
+   eyebrow uses, because it is doing the same job. Absent entirely on a
+   site-wide pass, which is the state every pass was in before scoping
+   existed. */
+#intention-badge-scope {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 #intention-badge-finish {
@@ -378,6 +423,25 @@ function injectOverlayStyle() {
 let currentSession = null;
 let matchedDomain = null;
 let matchedBlockConfig = null;
+// The AI route the last check reported: 'hosted', 'byok' or 'locked'. Cached
+// because the URL watcher reaches the drift screen without a fresh check in
+// hand, and the drift screen offers a button that only makes sense when there
+// is a coach behind it. Null means "not asked yet", which is treated as "there
+// may well be one" — the offer is withdrawn only on a route we know is locked.
+let matchedAccessRoute = null;
+// Which part of the site this address turned out to be, when the user has told
+// Intention to block only some of it ('instagram:reels', 'reddit:sub:rust').
+// Null on every target with no part rule, which is most of them. The gate's
+// subtitle is the only thing that reads it: naming the part is the difference
+// between "instagram.com — let's check in" and "Reels on instagram.com".
+let matchedPartId = null;
+// The target's part rule itself ({ scope, parts }), sanitized, when it has
+// one. Held module-side because the badge is rendered from both paths — the
+// worker's verdict and the storage fail-safe — and both have to hand it to the
+// URL watcher: a page-scoped pass on a site that is only PARTLY blocked has
+// two questions to answer on every in-page move, not one, and the watcher
+// cannot ask the part half without the rule.
+let matchedPartRule = null;
 let handled = false;
 // The best look at this page we have managed to get. It has to be captured
 // while the document still exists: the gate calls ensureBodyAndHush(), which
@@ -432,6 +496,9 @@ function samePage(a, b) {
 // backstop in background.js.
 function markHandled() {
   handled = true;
+  // Whatever is about to be rendered owns this page now. A watcher armed by
+  // the state it replaces can only fire against a page that no longer exists.
+  stopUrlWatch();
   try {
     chrome.runtime.sendMessage({ action: "gateShown" }, () => {
       // A suspended background page is the very condition the backstop exists
@@ -478,6 +545,14 @@ function showGate(why) {
 const CHECK_ATTEMPT_TIMEOUT_MS = 1200;
 const CHECK_RETRY_DELAYS_MS = [100, 250, 500, 1000];
 const CHECK_TOTAL_BUDGET_MS = 2500;
+
+// How long the drift screen waits for its endSession to land before it opens
+// the gate anyway. Long enough for a background page that only needs waking,
+// short enough that a user who pressed a button is never left watching a
+// disabled one. Going ahead without the reply risks two writes racing for one
+// session key; refusing to go ahead at all would be a screen with no way off
+// it, which is worse.
+const END_SESSION_HANDOVER_MS = 1500;
 
 function askBackground(message, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -528,7 +603,13 @@ async function runCheck() {
       if (handled) return;
       try {
         const response = await askBackground(
-          { action: "checkPageMatch", host, pageContext },
+          // The address, not just the host: which PART of a site this is, and
+          // whether a page-scoped pass still covers it, are both questions
+          // about the path. sender.url wins over this on the other end — it is
+          // the browser's own account of where the tab is — but a Safari
+          // content script can be answered by a background page that never saw
+          // a sender, so it is sent as well as inferred.
+          { action: "checkPageMatch", host, pageContext, url: window.location.href },
           CHECK_ATTEMPT_TIMEOUT_MS,
         );
         console.log(INT_LOG, "checkPageMatch response", response);
@@ -566,12 +647,55 @@ async function runCheck() {
   }
 }
 
+// Does the pass we were handed still apply to the address this page is at?
+//
+// The question is asked here, in the page, rather than taken from the
+// background's answer — not out of distrust but because the fail-safe path
+// below has no background to ask, and both paths have to reach the same
+// verdict. parts.js owns the answer itself (sessionCoversUrl), so there is
+// exactly one implementation of it in the codebase.
+function coversThisPage(session) {
+  return sessionCoversUrl(session, window.location.href);
+}
+
+// Is this pass still running at all?
+//
+// ONE implementation, because two paths ask it and they must not disagree:
+// the storage fail-safe below, deciding whether a stored session still counts,
+// and the URL watcher, deciding whether the screen it is about to put up is
+// about a pass that still exists. It is the same expression background.js's
+// activeSession() uses, deliberately — a pass the worker considers over must
+// not read as live in the page.
+//
+// Fails to "over" for anything it cannot compute: a session with no start time
+// or no length has no expiry to be inside, and treating it as live would leave
+// a page open on a pass nothing can ever end. NaN comparisons make that the
+// default answer, so the expression is left as it is rather than "hardened"
+// into one that returns true.
+function passIsLive(session) {
+  if (!session || session.endedAt) return false;
+  return Date.now() < session.startTime + session.intervalMinutes * 60000;
+}
+
 function applyCheckResult(response) {
   // "Not blocked" has to win over "setup unfinished", or an unfinished wizard
   // would blank every page on the web: this runs at document_start on
   // <all_urls>, and before setup there is no blocklist for anything to match.
   // The storage fallback below has always had it this way round.
   if (!response.isBlocked) {
+    // ...but the host may still be ON the blocklist, with a part rule that
+    // leaves this particular address open ("only Reels" — and this is not
+    // Reels). Nothing is rendered and nothing is blocked, yet this page is one
+    // pushState away from a part that IS blocked, and that navigation makes no
+    // request the worker can see. So the rule is kept and the address watched.
+    if (response.setupComplete && response.matchedDomain && response.partRule) {
+      matchedDomain = response.matchedDomain;
+      matchedPartId = null;
+      matchedPartRule = response.partRule;
+      armUrlWatch("parts", response.partRule);
+      subscribePartRuleChanges();
+      setupInterruptionListener();
+    }
     return;
   }
 
@@ -590,8 +714,20 @@ function applyCheckResult(response) {
 
   matchedDomain = response.matchedDomain;
   matchedBlockConfig = response.blockConfig || null;
+  matchedAccessRoute = response.accessRoute || null;
+  // Set before any of the branches below render: the gate's subtitle reads it.
+  matchedPartId = response.partId || null;
+  // ...and the rule that decided it, which the badge below arms the watcher
+  // with. `isBlocked` being true says this address is gated; it does not say
+  // the whole host is, and the difference is the entire point of keeping the
+  // rule here.
+  matchedPartRule = response.partRule || null;
 
-  if (response.session) {
+  // A live pass, and it covers the page actually being loaded. sessionCoversUrl
+  // answers true for any session with no scope at all, so every pass granted
+  // before scoping existed — and every whole-site pass granted since — takes
+  // this branch on every URL of its domain, exactly as it always did.
+  if (response.session && coversThisPage(response.session)) {
     if (handled) return;
     markHandled();
     currentSession = response.session;
@@ -605,6 +741,13 @@ function applyCheckResult(response) {
         setupInterruptionListener();
       }
     });
+  } else if (response.session) {
+    // Scoped, and this is not it. Not the full coach gate: they already had
+    // that conversation and the pass they won from it is still running.
+    if (handled) return;
+    currentSession = response.session;
+    setupInterruptionListener();
+    showScopeDrift(response.session);
   } else if (response.accessRoute === "locked") {
     // Blocked, with no coach to argue with. The site stays blocked —
     // there's just nothing to say to it from here.
@@ -682,7 +825,18 @@ async function checkFromStorage(host) {
   console.log(INT_LOG, "storage fallback ->", matched || "not blocked");
   if (!matched) return;
 
-  if (!stored.setupComplete) {
+  // Deliberately AFTER the part verdict below rather than before it, which is
+  // where it used to sit. checkPageMatch computes `isBlocked` as
+  // `!!matchedDomain && verdict.gated` and applyCheckResult returns on
+  // `!isBlocked` before it ever looks at setupComplete — so with the worker
+  // awake an unfinished install whose part rule leaves this address open
+  // renders nothing, and with the worker dead the same page was blanked by the
+  // "setup was never finished" interstitial. It fails towards blocking, so it
+  // was never a hole, but the whole contract of this path is that it reaches
+  // the SAME verdict the worker would, and a cell that disagrees is one nobody
+  // can reason about the next time either side grows a branch.
+  const setupIncomplete = !stored.setupComplete;
+  const renderSetupNeeded = () => {
     markHandled();
     try {
       ensureBodyAndHush();
@@ -691,27 +845,105 @@ async function checkFromStorage(host) {
     } catch (e) {
       console.error(INT_LOG, "failed to render setup needed UI:", e);
     }
-    return;
-  }
+  };
 
   matchedDomain = matched;
   // Same resolution the background worker would have run, from rules.js — the
   // point of this whole path is reaching that verdict with the worker dead.
-  matchedBlockConfig = resolveBlockConfig(limitEntryFor(matched, stored), stored);
+  const partEntry = limitEntryFor(matched, stored);
+  matchedBlockConfig = resolveBlockConfig(partEntry, stored);
+
+  // Which part of the site this is, asked here for the same reason everything
+  // else on this path is: Safari suspends the background page, so this is
+  // where a part rule is actually enforced there. readGateStorage already
+  // reads domainLimits, so the entry is in hand.
+  //
+  // Asked BEFORE the session below, and that order is the decision: a page a
+  // part rule leaves open was never blocked, so it must show nothing at all —
+  // not a countdown badge, and above all not the scope-drift screen, which
+  // would otherwise appear on a page the user is entitled to be on the moment
+  // they hold a page-scoped pass elsewhere on the site.
+  //
+  // resolvePartVerdict fails closed: a malformed entry, an id from a newer
+  // build inside an 'only' list, an address it cannot parse, all gate.
+  matchedPartRule = hasPartRule(partEntry) ? sanitizePartRule(partEntry) : null;
+  const partVerdict = resolvePartVerdict(partEntry, window.location.href);
+  matchedPartId = partVerdict.partId;
+  if (!partVerdict.gated) {
+    armUrlWatch("parts", matchedPartRule || sanitizePartRule(partEntry));
+    subscribePartRuleChanges();
+    setupInterruptionListener();
+    return;
+  }
+
+  // Now that this address is known to be gated, the unfinished-setup screen
+  // is the honest thing to show — and the worker-awake path would have shown
+  // it too. See the comment on renderSetupNeeded above.
+  if (setupIncomplete) {
+    renderSetupNeeded();
+    return;
+  }
 
   // Which per-tab key a live pass was granted under isn't knowable from
-  // inside the page, so any unexpired session for this domain counts. Erring
-  // towards letting a granted pass through beats re-gating someone who has
-  // already made their case to the coach.
+  // inside the page — a content script cannot ask for its own tab id, and on
+  // this path there is no worker to ask — so any unexpired session for this
+  // domain counts. Erring towards letting a granted pass through beats
+  // re-gating someone who has already made their case to the coach.
+  //
+  // ONE rule, for BOTH branches below, and the symmetry is the point.
+  //
+  // The drift branch used to demand the tab-agnostic `target:<domain>` key
+  // before it would render, on the reasoning that a `tab:<id>:<domain>` pass
+  // might belong to some other tab whose session key none of the drift
+  // screen's buttons could act on. The reasoning was sound and the effect was
+  // backwards: every pass granted from a content-script gate carries a tab id,
+  // so that test excluded the ordinary case and admitted almost nothing. The
+  // tab that really did hold a scoped pass was handed the full coach gate
+  // instead of the free drift screen — and winning that gate makes
+  // grantSession bank the running pass as 'extended' and overwrite it, so the
+  // scoped pass is destroyed and a grant is spent for a screen that costs
+  // neither.
+  //
+  // It was also incoherent with the branch above it, which hands a page a
+  // FULL PASS off a session it equally cannot prove this tab owns. Refusing
+  // the strictly more restrictive screen on evidence the permissive one does
+  // not ask for is a rule that only ever fails open. So both branches now read
+  // the same session, and the cost of that is stated rather than hidden: in a
+  // tab that is not the owner, "I'm done here" and "Ask about this instead"
+  // act on a session key this tab does not have, and end nothing. Both still
+  // block the page, which is the half that matters.
   const sessions = stored.activeSessions || {};
-  const live = Object.values(sessions).find(
-    (s) =>
-      s &&
-      s.domain === matched &&
-      !s.endedAt &&
-      Date.now() < s.startTime + s.intervalMinutes * 60000,
-  );
-  if (live) {
+  const isLive = (s) => s && s.domain === matched && passIsLive(s);
+  const liveEntries = Object.entries(sessions).filter(([, s]) => isLive(s));
+  // Preferred in the same order readSession prefers them, so that when both
+  // exist the page reads the one the worker would have picked. readSession
+  // tries sessionKeyFor(tabId, domain) — a `tab:<id>:<domain>` key — FIRST, and
+  // `target:<domain>` only after it. This used to have the order backwards,
+  // and the cell it got wrong failed open on the platform that relies on this
+  // path most: a tab holding a page-scoped pass under `tab:A:youtube.com`,
+  // alongside an unscoped `target:youtube.com` written by a coaching page that
+  // could not learn its own tab id (Safari does not populate sender.tab for
+  // extension pages, so coaching.js leaves selfTabId null), read the unscoped
+  // one and painted a "this page only" badge over a video the pass was never
+  // for. Awake, the worker would have shown the drift screen.
+  //
+  // A content script cannot know its own tab id, so it cannot reproduce
+  // readSession's lookup exactly — it can only prefer the *shape*. That is
+  // enough: where this tab is the owner the two now agree, and where the
+  // `tab:` key belongs to some other tab, preferring it still errs towards the
+  // narrower pass, which is the direction a fail-safe path has to take.
+  const chosenEntry =
+    liveEntries.find(([key]) => key.startsWith('tab:') && key.endsWith(`:${matched}`))
+    || liveEntries.find(([key]) => key === `target:${matched}`)
+    || liveEntries[0]
+    || null;
+  const live = chosenEntry ? chosenEntry[1] : null;
+  // Same split as applyCheckResult, and this is the copy that matters most:
+  // Safari suspends the background page, so this is the path a scoped pass is
+  // actually enforced on there. parts.js is in the content_scripts list ahead
+  // of this file precisely so sessionCoversUrl can be asked here, with nothing
+  // else running.
+  if (live && coversThisPage(live)) {
     markHandled();
     currentSession = live;
     runWhenBodyExists(() => {
@@ -726,8 +958,368 @@ async function checkFromStorage(host) {
     });
     return;
   }
+  // A live pass that does not cover this page. Same session the badge branch
+  // above would have honoured, judged by the same rule — see the comment on
+  // `chosenEntry` for why the two may not disagree about which pass is this
+  // tab's.
+  if (live) {
+    currentSession = live;
+    setupInterruptionListener();
+    showScopeDrift(live);
+    return;
+  }
 
   showGate("background unreachable (storage fail-safe)");
+}
+
+// ---------------------------------------------------------------------------
+// The URL watcher. ONE of them, deliberately.
+// ---------------------------------------------------------------------------
+//
+// A page-scoped pass is enforced by noticing that the address stopped being
+// the one it was granted for. On the sites this matters most for, that change
+// happens without a single network request: YouTube autoplays into the next
+// video, Reddit opens the next post, an SPA swaps its whole view — all of it
+// through history.pushState, which commits nothing and reloads nothing.
+//
+// Patching history.pushState does not work and is not a shortcut worth
+// trying: content scripts run in an isolated world in Chrome, Firefox and
+// Safari alike, so the function we would be patching is not the function the
+// page calls. What is left is polling, plus the events the browser does give
+// us, plus a message from the background when webNavigation notices
+// (onHistoryStateUpdated) — three signals into one callback, because a page
+// under a pass must not carry three timers.
+//
+// 600ms is the compromise: fast enough that the next video is stopped inside a
+// second, slow enough to be invisible next to the work an SPA does anyway.
+const URL_WATCH_MS = 600;
+
+// ...and a slower one while the tab is hidden. Slower, because nothing on
+// screen is waiting on it — but NOT off, which is what this used to be.
+//
+// The reasoning for skipping it outright was that "a hidden tab cannot be
+// autoplaying its way anywhere the user can see". True, and beside the point:
+// it can autoplay its way somewhere the user can HEAR. Take a twelve-minute
+// scoped pass on one video, switch tabs, and YouTube plays the whole chain
+// with audio while the badge quietly goes on saying THIS PAGE ONLY. The only
+// other signal is the background's urlChanged message, which comes from
+// webNavigation.onHistoryStateUpdated — an event whose Safari support is
+// explicitly unverified — so on the platform where this overlay is the only
+// enforcement there is, this poll was the whole of it, and it was asleep.
+//
+// 3s in the background is the battery answer to the same question 600ms
+// answers in the foreground: five times cheaper, and still inside the length
+// of the average autoplay lead-in.
+const URL_WATCH_HIDDEN_MS = 3000;
+
+// reason -> the state that reason needs to reach a verdict. 'scope' holds the
+// live session; 'parts' holds the target's part rule ({ scope, parts }), as
+// sanitized by parts.js. Empty means there is nothing to watch and no timer
+// runs — this file is injected into every page on the web, and a timer on all
+// of them for a feature almost none of them are using would be indefensible.
+const urlWatchReasons = {};
+let urlWatchTimer = null;
+// The interval the running timer was installed at, so a visibility change can
+// tell "already at the right pace" from "needs re-pacing" without tearing a
+// working timer down and putting an identical one back.
+let urlWatchTimerMs = 0;
+let urlWatchListening = false;
+// The address the last verdict was reached for. Compared before any work is
+// done, so the ordinary case (nothing moved) is one string comparison.
+let watchedUrl = "";
+
+// The single callback, and the ONE order of questions.
+//
+// The part question comes first — the same order checkFromStorage asks it in,
+// and for the same reason it spells out there: an address the user's own rule
+// leaves open was never blocked, so nothing at all may be put over it. Not a
+// countdown badge, and above all not the drift screen.
+//
+// This used to ask scope first, on the reasoning that a pass which has stopped
+// applying is the stronger fact about the page. It isn't, and the difference
+// was visible from the address bar: with "only r/rust" blocked and a scoped
+// pass live on an r/rust post, clicking through to r/cats — a pushState, since
+// Reddit is an SPA — drifted, while typing that same r/cats address rendered
+// nothing. The two paths have to agree, and the path that documents the
+// invariant is the one that is right.
+//
+// Once the address IS gated, scope decides, exactly as it did.
+function onUrlMaybeChanged() {
+  let href;
+  try {
+    href = window.location.href;
+  } catch (e) {
+    return;
+  }
+  // A pass can run out without the address moving at all — the user simply
+  // sits on the granted video until the twelve minutes are up. On Chrome the
+  // check-in alarm handles that; on Safari, where the background page is
+  // suspended, no alarm fires and nothing else in the page is watching the
+  // clock, so the badge used to sit at 12:00 / 12:00 over a live site
+  // indefinitely. So expiry is asked before the address is even compared, and
+  // "nothing moved" is no longer a reason to say nothing.
+  const session = urlWatchReasons.scope;
+  const expired = !!session && !passIsLive(session);
+  if (href === watchedUrl && !expired) return;
+  watchedUrl = href;
+
+  // The part half. This page was allowed a moment ago; the SPA has moved, and
+  // the address it moved to may be one the user asked to be stopped at. No
+  // request was made, nothing committed, and no content script re-ran — this
+  // callback is the only thing that can notice. resolvePartVerdict fails
+  // closed, so an unreadable rule gates rather than opens.
+  //
+  // Asked before the pass questions below, expiry included: an address the
+  // user's own rule leaves open was never blocked, so a pass ending is not
+  // news about it and nothing may be put over it.
+  const rule = urlWatchReasons.parts;
+  if (rule && typeof resolvePartVerdict === "function") {
+    const verdict = resolvePartVerdict(rule, href);
+    // Open under their own rule. Whatever pass may be running elsewhere on the
+    // site, this page is not blocked and nothing is rendered over it.
+    if (!verdict.gated) {
+      // ...including the countdown badge, which the invariant above names
+      // explicitly and this arm used to leave painted: an SPA move from the
+      // granted reel to the DM inbox kept a ticking THIS PAGE ONLY badge over
+      // a page the rule leaves entirely open. The badge goes; the watcher
+      // stays, because the next move may land back on a part that IS blocked
+      // and this callback is still the only thing that can see it.
+      if (badgeTeardown) badgeTeardown({ keepWatching: true });
+      // A pass that has run out is not news about a page that never needed
+      // it — but it must not be re-asked on every tick for as long as the tab
+      // is open either. Forget it and leave the poll watching the part rule
+      // alone, which is the only question this page still has.
+      if (expired) delete urlWatchReasons.scope;
+      return;
+    }
+    matchedPartId = verdict.partId;
+  }
+
+  // The scope half. This address is blocked; the only thing that can let the
+  // user stay on it is the pass they are holding.
+  //
+  // Whether that pass is still running comes first. The drift screen is a
+  // statement about a LIVE pass — "you have got 4:12 left, and it was for
+  // that video" — and rendering it off an expired one produced exactly the
+  // frozen "You've got 0:00 left" screen with a "Back to it" button that
+  // leads back to a page the pass no longer covers. When the pass is over the
+  // honest screen is the check-in, which is the same one the background's
+  // alarm asks for and has a coach behind it.
+  if (session && expired) {
+    showPassExpired(session);
+    return;
+  }
+  if (session && typeof sessionCoversUrl === "function") {
+    if (!sessionCoversUrl(session, href)) {
+      showScopeDrift(session);
+      return;
+    }
+    // Back on the page the pass was granted for, and blocked — so the badge
+    // belongs here. It is re-rendered rather than assumed still present,
+    // because the excursion arm above tears it down: a move onto a page the
+    // part rule leaves open removes the badge (it must — nothing may sit over
+    // an unblocked page), and badgeTeardown nulls itself on the way out, so
+    // nothing was left to bring it back. That left a user on a live pass with
+    // no timer, no scope label and, worse, no "Finished" button — the one
+    // affordance the whole scoped-pass idea is sold on, which is ending early
+    // and keeping the minutes you did not spend. Closing the tab was the only
+    // way left to it.
+    if (!badgeTeardown) renderStatusBadge(session);
+    return;
+  }
+
+  if (!rule) return;
+  // The old page's title, video and snippet describe somewhere they no longer
+  // are, and the coach would quote them back with confidence.
+  capturedPageCtx = null;
+  // Not showGate() directly: the background may have a live session, a locked
+  // account or a simple-mode config for this target, and runCheck is what
+  // knows how to ask. It falls back to checkFromStorage on its own when the
+  // worker is dead, and both paths reach this same verdict again.
+  runCheck();
+}
+
+// How often the poll should be running right now. A document that does not
+// report visibility at all is treated as visible — the faster of the two, so
+// an engine we cannot ask is watched properly rather than leniently.
+function urlWatchIntervalMs() {
+  try {
+    return document.visibilityState === "hidden" ? URL_WATCH_HIDDEN_MS : URL_WATCH_MS;
+  } catch (e) {
+    return URL_WATCH_MS;
+  }
+}
+
+// One timer, re-paced. Visibility changes what it costs, never whether it runs.
+function installUrlWatchTimer() {
+  const ms = urlWatchIntervalMs();
+  if (urlWatchTimer != null && urlWatchTimerMs === ms) return;
+  if (urlWatchTimer != null) clearInterval(urlWatchTimer);
+  urlWatchTimerMs = ms;
+  urlWatchTimer = setInterval(onUrlMaybeChanged, ms);
+}
+
+// A tab changing visibility re-paces the poll and then asks immediately: on
+// the way back because the answer is wanted now, and on the way out because
+// the move that hid the tab may be the very one that left the granted page.
+function onUrlWatchVisibilityChange() {
+  installUrlWatchTimer();
+  onUrlMaybeChanged();
+}
+
+function startUrlWatch() {
+  if (!Object.keys(urlWatchReasons).length) return;
+  if (!urlWatchListening) {
+    // popstate and hashchange are the two in-page navigations the browser does
+    // announce; the poll is for pushState, which it does not.
+    window.addEventListener("popstate", onUrlMaybeChanged);
+    window.addEventListener("hashchange", onUrlMaybeChanged);
+    document.addEventListener("visibilitychange", onUrlWatchVisibilityChange);
+    urlWatchListening = true;
+  }
+  installUrlWatchTimer();
+}
+
+// Idempotent: arming twice for the same reason replaces the state and leaves
+// one timer running.
+function armUrlWatch(reason, state) {
+  urlWatchReasons[reason] = state;
+  try {
+    watchedUrl = window.location.href;
+  } catch (e) {
+    watchedUrl = "";
+  }
+  startUrlWatch();
+}
+
+// A part rule edited in Settings while this page is open.
+//
+// Nothing else can deliver that here. A host carrying a part rule has no
+// declarativeNetRequest redirect (see domainsNeedingRedirect), and the gate
+// backstop only runs on a navigation that commits — so a tab sitting on an
+// allowed part of a site would keep the rule it was given until something
+// happened to it, and a user who had just tightened the rule in another tab
+// would watch the page they meant to shut stay open.
+//
+// Registered lazily, and only on a page a part rule actually let through: this
+// file runs on every page on the web, and a storage listener on all of them
+// for a feature almost none of them use is the same cost the timer above is
+// careful about.
+let partRuleWatchSubscribed = false;
+function subscribePartRuleChanges() {
+  if (partRuleWatchSubscribed) return;
+  partRuleWatchSubscribed = true;
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes || !changes.domainLimits) return;
+      if (!urlWatchReasons.parts || handled) return;
+      const entry = limitEntryFor(matchedDomain, { domainLimits: changes.domainLimits.newValue || {} });
+      if (!hasPartRule(entry)) {
+        // No rule left to be outside of: either the whole host is blocked
+        // again, or it is not blocked at all. Both answers come from the
+        // ordinary path, so hand it back to it.
+        stopUrlWatch();
+        runCheck();
+        return;
+      }
+      armUrlWatch("parts", sanitizePartRule(entry));
+      // armUrlWatch banks the current address as "already judged", which is
+      // exactly wrong here: the address has not moved, the RULE has, and this
+      // page has to be judged again under it.
+      watchedUrl = "";
+      onUrlMaybeChanged();
+    });
+  } catch (e) {
+    /* no storage listener available — the next navigation re-reads the rule */
+  }
+}
+
+// Everything, not just one reason. Whatever put Intention's own UI on this
+// page has taken the decision over, and a timer that outlives it can only
+// re-cover an overlay that replaced it — the exact failure the badge's own
+// teardown exists to prevent.
+function stopUrlWatch() {
+  for (const key of Object.keys(urlWatchReasons)) delete urlWatchReasons[key];
+  if (urlWatchTimer != null) {
+    clearInterval(urlWatchTimer);
+    urlWatchTimer = null;
+  }
+  urlWatchTimerMs = 0;
+  if (urlWatchListening) {
+    window.removeEventListener("popstate", onUrlMaybeChanged);
+    window.removeEventListener("hashchange", onUrlMaybeChanged);
+    document.removeEventListener("visibilitychange", onUrlWatchVisibilityChange);
+    urlWatchListening = false;
+  }
+}
+
+// The pass is still running; this is just no longer the page it was for.
+//
+// Deliberately LLM-free and instant. The user did not do anything wrong and
+// there is nothing to talk about: they were told the pass was for one page,
+// they left it, and the block came back exactly as described. A coach
+// conversation here would read as the tool having changed its mind.
+function showScopeDrift(session) {
+  // The badge's re-attach observer would put it back on top of the overlay,
+  // still counting, so it goes first — same ordering the check-in path uses.
+  if (badgeTeardown) badgeTeardown();
+  stopUrlWatch();
+  markHandled();
+  try {
+    // This is what stops the next video: ensureBodyAndHush pauses and mutes
+    // everything playing, then empties the document behind the overlay.
+    ensureBodyAndHush();
+    injectOverlayStyle();
+    renderScopeDriftUI(session);
+  } catch (e) {
+    console.error(INT_LOG, "failed to render the scope drift screen:", e);
+  }
+}
+
+// The pass ran out while this page was still open.
+//
+// The same screen the background's check-in alarm asks for, reached from
+// inside the page because on Safari that alarm may never fire: the background
+// page is suspended, nothing is counting, and the badge would otherwise go on
+// showing a finished pass over a live site. The user is not stranded by it —
+// the check-in is a coach conversation, so more time is one message away, and
+// closing the tab banks the minutes exactly as it does on the alarm path.
+function showPassExpired(session) {
+  const domain =
+    (session && session.domain) || matchedDomain || window.location.hostname;
+  renderCheckinTakeover(domain);
+}
+
+// Puts the check-in up over the page, the way the gate goes up over it.
+//
+// Returns whether it actually rendered, which is not decoration: the caller in
+// setupInterruptionListener answers the background with it, and the background
+// banks the pass when the answer is no. See the comment there.
+function renderCheckinTakeover(domain) {
+  // The pass has run out, so this has to block the page the same way the gate
+  // does. Rendering the panel alone left the site fully live behind it: video
+  // kept playing, the page kept scrolling, and an SPA re-render could drop the
+  // panel entirely — leaving no block at all.
+  //
+  // Order matters. The badge's own observer re-attaches it whenever it leaves
+  // the body, so it must be stopped before ensureBodyAndHush() wipes the body,
+  // or it reappears on top of the overlay still counting a session that has
+  // ended.
+  if (badgeTeardown) badgeTeardown();
+  markHandled();
+  try {
+    // The page they actually ended up on is the whole point of a check-in —
+    // capture it before the overlay empties the document, otherwise the coach
+    // can't tell they drifted off what they asked for.
+    capturePageContext();
+    ensureBodyAndHush();
+    injectOverlayStyle();
+    renderChatUI({ mode: "checkin", domain, blockConfig: matchedBlockConfig });
+    return true;
+  } catch (e) {
+    console.error(INT_LOG, "failed to render the check-in:", e);
+    return false;
+  }
 }
 
 runCheck();
@@ -874,6 +1466,167 @@ function renderInterstitial(subtitle, buttonLabel, section) {
   });
 }
 
+// The page-scoped counterpart to the gate: the pass is still running, this is
+// simply not the page it was granted for.
+//
+// Three ways out, and the order is the argument. Going back to what they asked
+// for is the primary action, because it is what they said they wanted ten
+// minutes ago. Talking to the coach about THIS page is a real option rather
+// than a trap — a scoped pass with no escape hatch reads as one — and it
+// spends a grant, exactly as any other conversation would. Stopping is the
+// third, and it banks the minutes they did not use.
+function renderScopeDriftUI(session) {
+  // Whatever this replaces goes first, its re-attach observer included: an
+  // observer left running puts the screen it belongs to straight back on top
+  // of this one the next time the body is re-rendered.
+  if (driftTeardown) driftTeardown();
+  const existing = document.getElementById("intention-root");
+  if (existing) existing.remove();
+
+  const scope = (session && session.scope) || {};
+  const remainingMs = Math.max(
+    0,
+    session.startTime + Number(session.intervalMinutes || 0) * 60000 - Date.now(),
+  );
+  const remainingMin = Math.floor(remainingMs / 60000);
+  const remainingSec = Math.floor((remainingMs % 60000) / 1000);
+  const remaining = `${remainingMin}:${String(remainingSec).padStart(2, "0")}`;
+
+  const root = document.createElement("div");
+  root.id = "intention-root";
+  const column = document.createElement("div");
+  column.className = "int-column";
+
+  // h1 is the gate's micro-label eyebrow; it says what state they are in, not
+  // what went wrong.
+  const eyebrow = document.createElement("h1");
+  eyebrow.textContent = "Pass still running";
+  const heading = document.createElement("p");
+  heading.className = "int-subtitle";
+  heading.textContent = "That pass was for one page";
+
+  const messages = document.createElement("div");
+  messages.className = "int-messages";
+  const body = document.createElement("div");
+  body.className = "int-msg int-msg-assistant";
+  // The label came off the page, so it is only ever set as text — and it is
+  // quoted rather than asserted, because it is their words for it, not ours.
+  body.textContent = scope.label
+    ? `You've got ${remaining} left, and it was for "${scope.label}". This is somewhere else.`
+    : `You've got ${remaining} left, and it was for the page you asked about. This is somewhere else.`;
+  messages.appendChild(body);
+
+  const actions = document.createElement("div");
+  actions.className = "int-drift-actions";
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "int-primary-btn";
+  backBtn.textContent = "Back to it";
+
+  const askBtn = document.createElement("button");
+  askBtn.type = "button";
+  askBtn.className = "int-secondary";
+  askBtn.textContent = "Ask about this instead";
+
+  const doneBtn = document.createElement("button");
+  doneBtn.type = "button";
+  doneBtn.className = "int-secondary";
+  doneBtn.textContent = "I'm done here";
+
+  actions.appendChild(backBtn);
+  // Withheld when there is demonstrably no coach to ask. This screen is
+  // reached before applyCheckResult's `locked` branch, so a balance that ran
+  // out mid-pass still renders a fully live "Ask about this instead" — and
+  // pressing it ends the pass FIRST and discovers there is no coach second.
+  // The minutes are banked, the drift screen is gone, and with it "Back to
+  // it": the user cannot return to the page they had eight minutes left on.
+  // Nothing lied to them about money; the button just spent something it
+  // could not deliver on. A null route means we have not asked, which is not
+  // the same as knowing, so the offer stands there.
+  if (matchedAccessRoute !== "locked") actions.appendChild(askBtn);
+  actions.appendChild(doneBtn);
+
+  const note = document.createElement("p");
+  note.className = "int-drift-note";
+  note.textContent = "You are only charged for the minutes you actually used.";
+
+  column.appendChild(eyebrow);
+  column.appendChild(heading);
+  column.appendChild(messages);
+  column.appendChild(actions);
+  column.appendChild(note);
+  root.appendChild(column);
+  document.body.appendChild(root);
+  // An SPA re-rendering <body> must not be able to drop the block.
+  const detach = keepAttached(root);
+
+  // The way out, for the one thing that outranks this screen. See the check-in
+  // handler in setupInterruptionListener: a check-in has a conversation to
+  // have and minutes to bank, and this screen has neither, so it stands down
+  // rather than swallowing it. Cleared as soon as it is spent, so that a
+  // check-in arriving later cannot mistake the gate this screen handed over to
+  // for a drift screen it may walk over.
+  function teardown() {
+    detach();
+    root.remove();
+    if (driftTeardown === teardown) driftTeardown = null;
+  }
+  driftTeardown = teardown;
+
+  const domain = session.domain || matchedDomain || window.location.hostname;
+
+  // A real navigation, not a history entry: the page underneath has been
+  // emptied by ensureBodyAndHush, so the way back is to load it again. The
+  // session is left alone — they are returning to the thing it is for.
+  backBtn.addEventListener("click", () => {
+    if (scope.url) window.location.href = scope.url;
+    else window.location.reload();
+  });
+
+  // Ends the scoped pass on its own terms (banking the minutes actually used
+  // under its own outcome) and opens a normal gate for where they are now.
+  //
+  // WAITED FOR, not fired off. Both halves of this touch the same session key:
+  // endSession retires it, and a grant won at the gate that replaces this
+  // screen writes a new one under it. Started together, the order they land in
+  // is the storage queue's business — and the losing order has retireSessionKey
+  // deleting the pass the user just won, or grantSession banking it a second
+  // time as 'extended'. One round trip is cheap next to a conversation.
+  //
+  // It must not become a trap if the worker never answers, so the gate is
+  // rendered on the failure path too (askBackground rejects on a timeout, and
+  // both paths run `proceed`). Until then the drift screen stays up: the user
+  // is never left looking at a page with nothing on it.
+  askBtn.addEventListener("click", () => {
+    askBtn.disabled = true;
+    const proceed = () => {
+      // Something else took the page while we waited — a check-in, or a second
+      // drift render. Whatever it is owns the page now; do not paint over it.
+      if (driftTeardown !== teardown) return;
+      currentSession = null;
+      // This screen is spent: what replaces it is a conversation, and a
+      // conversation is not something a check-in may sweep away.
+      teardown();
+      renderChatUI({ mode: "gate", domain, blockConfig: matchedBlockConfig });
+    };
+    askBackground(
+      { action: "endSession", domain, reason: "left_page" },
+      END_SESSION_HANDOVER_MS,
+    ).then(proceed, proceed);
+  });
+
+  // Same as the badge's "Finished": the background banks the time and closes
+  // the tab.
+  doneBtn.addEventListener("click", () => {
+    chrome.runtime.sendMessage({
+      action: "endSession",
+      domain,
+      reason: "fulfilled",
+    });
+  });
+}
+
 function renderChatUI({ mode, domain, blockConfig }) {
   if (document.getElementById("intention-root")) {
     document.getElementById("intention-root").remove();
@@ -884,9 +1637,21 @@ function renderChatUI({ mode, domain, blockConfig }) {
     return;
   }
 
+  // At the gate, name the PART when there is one. "instagram.com — let's check
+  // in" is a sentence about a site they may well have every right to be on
+  // under their own rule; "Reels on instagram.com" is the thing they actually
+  // asked to be stopped at, and saying so is the difference between the block
+  // reading as arbitrary and reading as theirs.
+  //
+  // Not at check-in: a pass covers the whole target for its length, so the
+  // part that opened the gate half an hour ago may be nowhere near where they
+  // are now, and naming it there would be stale.
+  const partHere = mode === "gate" && matchedPartId && typeof partLabel === "function"
+    ? partLabel(matchedPartId)
+    : "";
   const subtitle =
     mode === "gate"
-      ? `${domain} — let's check in before you go through`
+      ? `${partHere ? `${partHere} on ` : ""}${domain} — let's check in before you go through`
       : `${domain} — your time is up`;
 
   const root = document.createElement("div");
@@ -898,6 +1663,7 @@ function renderChatUI({ mode, domain, blockConfig }) {
       <h1>Intention</h1>
       <p class="int-subtitle"></p>
       <div class="int-stats-row" id="int-stats-row" style="display: none;"></div>
+      <div class="int-credit-note" id="int-credit-note" hidden></div>
       <div class="int-messages" id="int-messages"></div>
       <div class="int-composer">
         <input type="text" id="int-input" placeholder="Type your reply…" autocomplete="off">
@@ -1107,9 +1873,26 @@ let domainStats = null;
 // session, on top of the overlay.
 let badgeTeardown = null;
 
+// The same, for the scope-drift screen: its node and its re-attach observer.
+// It is the one overlay that another overlay is allowed to replace, so it is
+// the one that has to be able to take itself down on request.
+let driftTeardown = null;
+
 function renderStatusBadge(session) {
   const badge = document.createElement("div");
   badge.id = "intention-badge";
+
+  // What the pass is FOR, when it is for one thing in particular. The badge on
+  // a scoped pass has to name the page, or "the block came back" a minute
+  // later looks like a fault rather than the deal they agreed to. Absent
+  // entirely on a site-wide pass — there is no one page to name.
+  const scope = session && session.scope;
+  if (scope) {
+    const scopeEl = document.createElement("span");
+    scopeEl.id = "intention-badge-scope";
+    scopeEl.textContent = "This page only";
+    badge.appendChild(scopeEl);
+  }
 
   const timeEl = document.createElement("span");
   timeEl.id = "intention-badge-time";
@@ -1136,11 +1919,31 @@ function renderStatusBadge(session) {
     const boundary = Number(session.intervalMinutes) > 0
       ? ` / ${String(session.intervalMinutes).padStart(2, "0")}:00`
       : "";
-    timeEl.textContent = `⏱ ${timeStr}${boundary}${session.reason ? ' · "' + session.reason + '"' : ""}`;
+    // On a scoped pass the destination replaces the stated reason: it is the
+    // more specific of the two ("Watching 'Never Gonna Give You Up'" says what
+    // the reason was for), and two quoted strings on one badge is a mess. Both
+    // are page-derived strings and both are set as text, never as markup.
+    const tail = scope
+      ? ` · ${scope.verb || "On"} "${scope.label || "this page"}"`
+      : session.reason ? ' · "' + session.reason + '"' : "";
+    timeEl.textContent = `⏱ ${timeStr}${boundary}${tail}`;
   }
   update();
   const intervalId = setInterval(update, 1000);
   document.body.appendChild(badge);
+
+  // The enforcement half of the badge. Armed only for a scoped pass, so an
+  // ordinary site pass runs no timer at all.
+  if (scope) {
+    armUrlWatch("scope", session);
+    // The part rule rides along, because on a site that is only partly blocked
+    // the scope question cannot be asked on its own. Left off, every in-page
+    // move was judged by the pass alone: r/rust post -> r/cats put the drift
+    // screen over a page the user's own rule leaves entirely open, while the
+    // SAME address reached by a real navigation rendered nothing at all. One
+    // URL, two verdicts, decided by how they got there.
+    if (matchedPartRule) armUrlWatch("parts", matchedPartRule);
+  }
 
   // "Finished" means the user is done here: end the session and let the
   // background close the tab. Stop the timer and the re-attach observer first
@@ -1161,10 +1964,17 @@ function renderStatusBadge(session) {
   });
   observer.observe(document.body, { childList: true });
 
-  function teardown() {
+  // `keepWatching` is for the one caller that is taking the badge down WITHOUT
+  // taking the page over: the URL watcher, on an address the user's own part
+  // rule leaves open. Everything else that calls this is about to render an
+  // overlay, and for those the watcher must die with the badge — a timer that
+  // outlives it would keep asking about a session that has ended, and could
+  // re-cover a check-in overlay with a drift screen for a pass already over.
+  function teardown(options) {
     clearInterval(intervalId);
     observer.disconnect();
     badge.remove();
+    if (!(options && options.keepWatching)) stopUrlWatch();
     if (badgeTeardown === teardown) badgeTeardown = null;
   }
   badgeTeardown = teardown;
@@ -1181,38 +1991,109 @@ function keepAttached(node) {
   return () => observer.disconnect();
 }
 
+// Registered from four places now — a badge, a drift, a gate, and a page a
+// part rule let through — and at most once per page. Two listeners would ask
+// the URL watcher the same question twice on every in-page navigation and
+// answer a check-in twice.
+let interruptionListening = false;
 function setupInterruptionListener() {
-  chrome.runtime.onMessage.addListener((message) => {
+  if (interruptionListening) return;
+  interruptionListening = true;
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // webNavigation noticed an in-page navigation before the poll did. Same
+    // callback, so there is one verdict and one place it is reached; the poll
+    // is what makes this a fast path rather than a dependency, since Safari's
+    // support for the event it comes from is not something to rely on.
+    if (message.action === "urlChanged") {
+      onUrlMaybeChanged();
+      return;
+    }
     if (message.action === "showCheckin") {
-      if (!document.getElementById("intention-root")) {
-        // The pass has run out, so this has to block the page the same way the
-        // gate does. Rendering the panel alone left the site fully live behind
-        // it: video kept playing, the page kept scrolling, and an SPA re-render
-        // could drop the panel entirely — leaving no block at all.
-        //
-        // Order matters. The badge's own observer re-attaches it whenever it
-        // leaves the body, so it must be stopped before ensureBodyAndHush()
-        // wipes the body, or it reappears on top of the overlay still counting
-        // a session that has ended.
-        if (badgeTeardown) badgeTeardown();
-        markHandled();
-        try {
-          // The page they actually ended up on is the whole point of a
-          // check-in — capture it before the overlay empties the document,
-          // otherwise the coach can't tell they drifted off what they asked for.
-          capturePageContext();
-          ensureBodyAndHush();
-          injectOverlayStyle();
-          renderChatUI({
-            mode: "checkin",
-            domain:
-              currentSession?.domain || matchedDomain || window.location.hostname,
-            blockConfig: matchedBlockConfig,
-          });
-        } catch (e) {
-          console.error(INT_LOG, "failed to render check-in:", e);
-        }
+      // WHETHER THE CHECK-IN WENT UP IS THE ANSWER, and the background acts on
+      // it: a `false` here is what makes bankExpiredSession run, so the pass's
+      // minutes are recorded and the session is dropped instead of sitting in
+      // activeSessions with no endedAt forever.
+      //
+      // The old contract was "a delivered message means a rendered check-in",
+      // and it was not true of any of the three arms that decline to render.
+      // A registered listener that returns still resolves
+      // chrome.tabs.sendMessage on the other side, so its catch never ran and
+      // the banking that lives in that catch was skipped every time this page
+      // said no. A resolved sendMessage is proof that a content script exists,
+      // and nothing else.
+      const shown = handleCheckinRequest(message);
+      try {
+        sendResponse({ shown });
+      } catch (e) {
+        /* the sender is gone; the background's own catch banks it */
       }
+      return;
     }
   });
+}
+
+// Should the check-in take this page over, and did it?
+//
+// Three ways to answer no, and the first is the one that matters most.
+function handleCheckinRequest(message) {
+  // 1. This page may not be gated at all.
+  //
+  // The listener is registered from four places now, and one of them is a page
+  // a part rule LEAVES OPEN — armed there so an SPA move onto a blocked part
+  // is noticed. Nothing downstream re-asked the question, so a check-in for a
+  // pass earned on Reels landed on the DM thread the user's own rule allows,
+  // erased it, and offered a Close tab button. The invariant this file states
+  // three times over — a page the rule leaves open must show nothing at all —
+  // has to hold for a message just as much as for a poll tick.
+  if (!checkinAppliesHere(message && message.domain)) return false;
+
+  // 2. A check-in always wins over the drift screen, and only over the drift
+  //    screen. Nothing else here may be replaced: a gate or an earlier
+  //    check-in is a conversation in progress, and a screen that says "your
+  //    time is up" is not worth losing one for.
+  if (driftTeardown) driftTeardown();
+  else if (document.getElementById("intention-root")) return false;
+
+  // 3. ...and rendering can still throw, in which case nothing is over the
+  //    page and the honest answer is still no.
+  return renderCheckinTakeover(
+    (message && message.domain) ||
+      currentSession?.domain ||
+      matchedDomain ||
+      window.location.hostname,
+  );
+}
+
+// Is this check-in about the page this tab is actually on?
+//
+// Two questions, and both fail towards showing it — a check-in that appears
+// where it need not have is a screen with a coach behind it, while one that is
+// wrongly withheld is a pass that never ends.
+//
+//   * The DOMAIN. A tab may hold passes on two blocked sites at once, and the
+//     alarm names one of them. Blanking the site they are on now to announce
+//     that a pass on some other site has expired would take away a page they
+//     are entitled to be on; the background banks those minutes instead.
+//     Absent (an older sender) means "no opinion", not "no".
+//   * The PART RULE, asked exactly as the poll asks it, so the message path
+//     and the poll path cannot reach different verdicts about one address.
+//     resolvePartVerdict fails closed, so an unreadable rule shows the
+//     check-in.
+function checkinAppliesHere(domain) {
+  let href = "";
+  let host = "";
+  try {
+    href = window.location.href;
+    host = window.location.hostname;
+  } catch (e) {
+    return true;
+  }
+  if (domain && !(host === domain || host.endsWith("." + domain))) return false;
+  const rule = urlWatchReasons.parts || matchedPartRule;
+  if (!rule || typeof resolvePartVerdict !== "function") return true;
+  try {
+    return !!resolvePartVerdict(rule, href).gated;
+  } catch (e) {
+    return true;
+  }
 }

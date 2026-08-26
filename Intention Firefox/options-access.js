@@ -17,6 +17,24 @@ function persistEntitlement(entitlement) {
   return sendBg({ action: 'saveEntitlement', entitlement });
 }
 
+// The same write, but as a patch merged over whatever is stored right now
+// rather than a whole-object replacement of a snapshot taken before an await.
+//
+// Every recovery write goes through this, because every one of them is on the
+// far side of an unbounded network call. The purchase that completed while
+// /v1/entitlement/recover was in flight — the user came back from the Play
+// sheet, 'intention-app-active' fired, a second refreshAccessUI ran and
+// persisted 5,000 credits — is the case that matters: the 404 arriving
+// afterwards used to write back its own stale snapshot and take the receipt,
+// the token and the balance with it. It took the money and locked the user out,
+// and the recoveryCheckedAt it wrote in their place suppressed the re-check for
+// a day. The merge itself is background.js's mergeEntitlement — named apart
+// from this the way saveEntitlement is named apart from persistEntitlement,
+// because one of the pair is a message and the other is the write.
+function patchEntitlement(patch) {
+  return sendBg({ action: 'mergeEntitlement', entitlement: patch });
+}
+
 async function currentBackendUrl() {
   const state = await getConfig();
   return state?.backendUrl || '';
@@ -49,16 +67,104 @@ async function verifyAndStore(platform, receipt) {
 // simply missing. There's no renewal to pre-empt for a top-up, so unlike the
 // old subscription version, this only re-checks when something is actually
 // unresolved rather than on a timer.
-async function reconcileEntitlement(entitlement) {
-  if (!entitlement) return null;
+//
+// `route` is the resolved AI route, threaded through to the account-id
+// question at the bottom of this — see RECOVERY_ROUTES in billing.js for why
+// that is a different question from which build this is.
+async function reconcileEntitlement(entitlement, route) {
+  // Nothing to re-check against — no token, no receipt, quite possibly no
+  // entitlement at all. This used to return immediately, and it is exactly the
+  // shape a reinstall leaves behind: the balance is still on the server, the
+  // account id is still on the device, and the only thing missing was anyone
+  // asking. It is also the shape a brand-new user has, which is why the
+  // question has to be asked silently and a "no" has to be silent too.
+  if (!entitlement || (!entitlement.token && !entitlement.receipt)) {
+    return recoverStrandedCredit(entitlement, { route });
+  }
   const stale = entitlement.pendingVerification || !entitlement.token;
   if (!stale) return entitlement;
   const backendUrl = await currentBackendUrl();
-  const refreshed = await refreshEntitlement(entitlement, backendUrl);
+  const refreshed = await refreshEntitlement(entitlement, backendUrl, { route });
   if (refreshed && entitlementSignature(refreshed) !== entitlementSignature(entitlement)) {
     await persistEntitlement(refreshed);
   }
   return refreshed;
+}
+
+// How long a "we asked, there was nothing" answer stands before it is worth
+// asking again. /v1/entitlement/recover is unauthenticated and rate-limited
+// per IP, so a settings page that re-asked on every open would burn the
+// allowance of everyone behind the same office or campus NAT on behalf of one
+// person opening a tab. A day is long enough to be free and short enough that
+// an Android backup landing overnight is noticed by morning.
+const RECOVERY_RECHECK_MS = 24 * 60 * 60 * 1000;
+
+// `force` skips the marker: the manual "Restore credit from a previous
+// install" button exists precisely for the person who knows something has
+// changed since we last asked, and telling them to come back tomorrow would
+// make the button a decoration. It is also the one caller that is allowed to
+// hear about a failure, because it is the one somebody is watching.
+async function recoverStrandedCredit(entitlement, { force = false, route = null } = {}) {
+  // A browser build has no bridge, therefore no account id, therefore nothing
+  // to ask with — and attemptSilentRecovery would correctly make no request.
+  // The guard is here as well so that a fresh Chrome install does not get an
+  // entitlement object written over its `null` purely to record a question we
+  // were never going to ask.
+  if (BILLING_MODE !== 'store') return entitlement || null;
+  // And the same again for the route rather than the build, which is not the
+  // same test: BILLING_MODE is 'store' on Android whether the coach is running
+  // on our credit or on the user's own Anthropic key. attemptSilentRecovery
+  // refuses 'byok' itself; stopping here as well means we also skip writing a
+  // recoveryCheckedAt marker to record a question nobody was going to ask.
+  // `force` is exempt, here and in attemptSilentRecovery's own guard: pressing
+  // "Restore credit from a previous install" is itself the request, whatever
+  // route the coach happens to be on.
+  if (!force && !RECOVERY_ROUTES.includes(route)) return entitlement || null;
+
+  const checkedAt = Number(entitlement?.recoveryCheckedAt || 0);
+  if (!force && Date.now() - checkedAt < RECOVERY_RECHECK_MS) return entitlement || null;
+
+  const backendUrl = await currentBackendUrl();
+  let recovered = null;
+  try {
+    recovered = await attemptSilentRecovery(backendUrl, { route, userAsked: force });
+  } catch (e) {
+    // An opportunistic question must never be able to take the page down with
+    // it, and this one could: nothing between here and options.js's
+    // showSettingsView catches, so one offline /v1/entitlement/recover used to
+    // abort the whole settings render — no blocked-site list, no mode card, no
+    // stats, no buttons bound. A device that cannot reach the backend has
+    // simply not been told anything, so nothing is written down (not even the
+    // 24-hour marker, since we never got an answer to record) and the next
+    // settings open asks again.
+    if (force) throw e;
+    return entitlement || null;
+  }
+  if (recovered) {
+    // Merged, not replaced: /v1/entitlement/recover knows nothing about a
+    // receipt, so writing its answer whole would delete the one we are holding.
+    return (await patchEntitlement(recoveredPatch(recovered)))?.entitlement || recovered;
+  }
+  // Nothing attached to this device. Record only the fact that we asked, on
+  // top of whatever is there NOW — a purchase may well have landed while the
+  // question was in flight, and this used to overwrite it with a snapshot taken
+  // before it existed.
+  const marked = await patchEntitlement({ recoveryCheckedAt: Date.now() });
+  return marked?.entitlement || { ...(entitlement || { active: false, source: '' }), recoveryCheckedAt: Date.now() };
+}
+
+// What a successful recovery actually learned, and nothing else.
+//
+// recoverEntitlement normalises its response like any other, which means it
+// arrives carrying `receipt: null` — not because the receipt is gone but
+// because that endpoint has never heard of one. Merging the whole object would
+// therefore delete a perfectly good stored receipt, which is the only thing
+// that can re-verify this device later. So the receipt is left out of the
+// patch, and whatever is stored keeps standing.
+function recoveredPatch(recovered) {
+  const patch = { ...recovered };
+  delete patch.receipt;
+  return patch;
 }
 
 async function refreshAccessUI(containerId, { compact = false } = {}) {
@@ -140,6 +246,50 @@ async function refreshAccessUI(containerId, { compact = false } = {}) {
       const backendUrl = await currentBackendUrl();
       return requestAccessCode(entitlement, backendUrl);
     },
+    // The written-down code, shown wherever there is a session that may mint
+    // one. Which sessions those are is billing.js's canMintRecoveryCode, and
+    // the paywall applies it rather than this file: a browser that redeemed a
+    // fifteen-minute link code from a phone holds a bearer good enough to spend
+    // the balance but not to escalate itself into a permanent credential, and
+    // the server has always refused it. What changed is that we no longer offer
+    // the button and then print an error — it says where the code lives.
+    //
+    // onUpgrade catches the other half. A device that bought its credit before
+    // the server stamped sessions gets its receipt re-verified mid-request, and
+    // persisting the freshly stamped token here is what makes that a one-time
+    // upgrade rather than something every settings open pays for again.
+    onShowRecoveryCode: async ({ rotate = false } = {}) => {
+      const backendUrl = await currentBackendUrl();
+      return requestRecoveryCode(entitlement, backendUrl, {
+        rotate,
+        onUpgrade: (upgraded) => persistEntitlement(upgraded)
+      });
+    },
+    // The manual form of the silent check, for the person who has just
+    // restored a backup or signed back into their store account and knows more
+    // than we did an hour ago. Resolves to a notice rather than throwing on a
+    // miss: not finding credit is the expected answer for most of the people
+    // who will press it.
+    onRecoverFromDevice: BILLING_MODE === 'store' ? async () => {
+      // Re-read rather than reusing the render-time snapshot above: this button
+      // is pressed minutes after the paywall was painted, and by then a
+      // purchase, a redemption or the app-active sweep may have moved the
+      // entitlement on. The write itself merges (see mergeEntitlement), so a
+      // stale base can no longer clobber; what a stale base would still get
+      // wrong is the answer this returns to the user.
+      const fresh = await getAccessState();
+      const recovered = await recoverStrandedCredit(fresh?.entitlement || null,
+        { force: true, route: fresh?.route || null });
+      if (!entitlementIsActive(recovered)) {
+        return 'No credit is attached to this device. If you bought credit before, paste your recovery code below.';
+      }
+      await rerender();
+      await onAccessChanged();
+      return null;
+    } : null,
+    // Only Android's bridge can answer this; Apple's omits it and it stays
+    // undefined, which renders nothing. See storeAccountRestored in billing.js.
+    accountRestored: await accountRestoredFlag(),
     // Offered wherever a store doesn't forbid it: Chrome/Firefox, where it is
     // the way in, and Android, where it sits under the purchase buttons as an
     // alternative. On Apple it stays null and lives solely in Settings ->
@@ -158,10 +308,41 @@ async function refreshAccessUI(containerId, { compact = false } = {}) {
   });
 
   // A verified purchase that arrived while the app was closed settles here.
-  const reconciled = await reconcileEntitlement(entitlement);
+  // Deliberately last, and deliberately unable to fail: everything above has
+  // already rendered, and a backend we cannot reach must not take the page with
+  // it. recoverStrandedCredit and refreshEntitlement both swallow their own
+  // network failures now; this is the backstop for anything else, because the
+  // caller of this function (options.js's showSettingsView) does not await it
+  // and would lose the rest of the settings page to a rejection.
+  let reconciled = entitlement;
+  try {
+    reconciled = await reconcileEntitlement(entitlement, access?.route || null);
+  } catch (e) {
+    console.warn('Intention: could not re-check coaching credit', e);
+    return;
+  }
   if (entitlementSignature(reconciled) !== entitlementSignature(entitlement)) {
     await refreshAccessUI(containerId, { compact });
     await onAccessChanged();
+  }
+}
+
+// Whether the platform put this device's account id back, or `undefined` where
+// that cannot be told — which every caller must treat as "say nothing".
+//
+// Wrapped, because this is a second round trip to the native bridge evaluated
+// inside the argument list of the render call: a bridge that throws, or one
+// that answers a method it does not implement by never calling back at all,
+// used to leave the AI-access card permanently empty with nothing logged. The
+// deadline lives in sendBilling; this catches the throwing half, the way the
+// neighbouring accountToken call in billing.js already does.
+async function accountRestoredFlag() {
+  if (BILLING_MODE !== 'store') return undefined;
+  try {
+    return await storeAccountRestored();
+  } catch (e) {
+    console.warn('Intention: store bridge could not answer accountToken', e);
+    return undefined;
   }
 }
 
@@ -192,6 +373,9 @@ async function onAccessChanged() {
   const access = await getAccessState();
   const modal = document.getElementById('paywall-modal');
   if (access?.route !== 'locked' && modal && !modal.hidden) modal.hidden = true;
+  // The header chip is the one balance readout that is on screen no matter
+  // which tab is showing, so anything that can move the balance has to tell it.
+  await refreshCreditChip();
 }
 
 // The setup wizard and the settings view both need a way to send someone who

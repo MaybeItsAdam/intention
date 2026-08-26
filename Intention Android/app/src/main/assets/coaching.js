@@ -231,14 +231,27 @@ async function init() {
 // ping-pong the tab.
 async function passThroughIfGranted() {
   if (isApp || mode === 'checkin') return false;
+  // The destination is needed BEFORE the question is asked now, not just after
+  // it is answered: a page-scoped pass only passes them through to the page it
+  // was granted for, so the background has to be told where they were going.
+  await intendedUrlReady;
   let session = null;
+  let covers = true;
   try {
-    const resp = await sendTabMessage({ action: 'getSession', domain }, 10000);
+    const resp = await sendTabMessage({ action: 'getSession', domain, url: intendedUrl }, 10000);
     session = resp?.session || null;
+    covers = resp?.covers !== false;
   } catch (e) {
     return false;
   }
   if (!session) return false;
+  // A live pass for a DIFFERENT page is not a reason to skip the gate — it is
+  // the reason the gate is there. Hopping anyway would take someone who
+  // clicked through to a second page and silently put them back on the first,
+  // which is a worse answer than the coach they were expecting. Also covers
+  // the case where the address they were heading for was never recorded: with
+  // nowhere to check the scope against, the gate is the safe answer.
+  if (!covers) return false;
 
   const marker = `intention:passed:${domain}:${session.startTime}`;
   try {
@@ -247,8 +260,9 @@ async function passThroughIfGranted() {
   } catch (e) {
     // No session storage (private browsing): the hop is still worth making.
   }
-  await intendedUrlReady;
-  window.location.href = intendedUrl || `https://${domain}`;
+  // Same rule as followGrantedSession: a scoped pass only covers one page, so
+  // that page is where the hop has to land.
+  window.location.href = session.scope?.url || intendedUrl || `https://${domain}`;
   return true;
 }
 
@@ -404,7 +418,15 @@ function followGrantedSession(grantedSession, delayMs = 600) {
     } else {
       // Chrome/Firefox/Safari: coaching.html IS the blocked tab, so redirect it
       // — back to whatever was asked for, if the background still knows it.
-      window.location.href = intendedUrl || `https://${domain}`;
+      //
+      // A page-scoped pass names its own destination and that one wins: it is
+      // the exact address the pass was granted for, canonicalised, and it is
+      // the only address the narrowed allow rule will let past the domain's
+      // redirect. Sending them to the recorded intended URL instead would work
+      // most of the time and, whenever the two differ by so much as a
+      // fragment, land them straight back on the gate they just talked
+      // through.
+      window.location.href = grantedSession?.scope?.url || intendedUrl || `https://${domain}`;
     }
   }, delayMs);
 }

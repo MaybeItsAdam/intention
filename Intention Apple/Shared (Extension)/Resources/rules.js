@@ -105,3 +105,58 @@ function resolveLimits(entry) {
     looseUntilMinutes: normalizeLooseUntil(entry.looseUntilMinutes)
   };
 }
+
+// ===========================================================================
+// LEAVING — the cool-off a user puts in front of removing Intention
+// ===========================================================================
+//
+// Removing Intention is the biggest loosening there is, so it goes through the
+// same mechanism every other loosening does: a conversation with the coach.
+// This is the one number the user sets in front of that conversation — "when I
+// ask to leave, make me wait N hours first" — and it lives here for the same
+// reason everything else in this file does. background.js decides whether the
+// wait has elapsed, options.js paints the picker, and prompts.js tells the
+// coach how long it is; three contexts, one answer.
+//
+// Nothing here is a lock and the copy must never suggest otherwise. The wait
+// is something the user chose while they were thinking clearly, and there is
+// always a working way out before it is up — see docs/LEAVING.md.
+
+// Off, an hour, a day, three days. A fixed ladder rather than a free-text
+// number of minutes because this is a commitment, not a setting: an arbitrary
+// value invites the haggling ("call it forty minutes") that the whole feature
+// exists to slow down, and four rungs is enough to mean something.
+const LEAVE_DELAY_CHOICES = [0, 60, 1440, 4320];
+
+// Snap an arbitrary value onto the ladder.
+//
+// It snaps DOWN, never up, and that direction is the whole point. Rounding to
+// the *nearest* rung would let a corrupt or hand-edited 90 become 1440 — a
+// day's wait nobody agreed to, imposed by a rounding rule. Snapping down can
+// only ever give the user back time they already had a claim on, which is the
+// safe direction to be wrong in for a number that stands between someone and
+// the exit. Anything unreadable is 0 (no delay at all) for the same reason:
+// the failure mode of this function must never be a longer commitment.
+function normalizeLeaveDelay(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  let out = 0;
+  for (const choice of LEAVE_DELAY_CHOICES) {
+    if (choice <= n) out = choice;
+  }
+  return out;
+}
+
+// The delay as the coach and the settings card both say it. Prose rather than
+// a number of minutes because both of them are writing sentences: "your
+// 24 hours starts now" reads as a promise, "your 1440 minutes starts now"
+// reads as a machine. The empty string for "no delay" is deliberate — every
+// caller either has a sentence for that case or has nothing to say at all.
+function formatLeaveDelay(minutes) {
+  switch (normalizeLeaveDelay(minutes)) {
+    case 60: return 'an hour';
+    case 1440: return '24 hours';
+    case 4320: return '3 days';
+    default: return '';
+  }
+}

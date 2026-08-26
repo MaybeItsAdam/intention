@@ -25,6 +25,9 @@
   --success-fill: rgba(76, 195, 142, 0.12);
   --success-line: rgba(76, 195, 142, 0.45);
   --danger-text: #d62246;
+  --warning-text: #8a6200;
+  --warning-fill: rgba(255, 191, 0, 0.14);
+  --warning-line: rgba(255, 191, 0, 0.45);
   --scrim: rgba(20, 18, 26, 0.45);
   --radius-card: 8px;
   --radius-control: 6px;
@@ -45,6 +48,7 @@
     --primary-text: #66b2ff;
     --success-text: #4cc38e;
     --danger-text: #ff6b85;
+    --warning-text: #ffbf00;
     --scrim: rgba(0, 0, 0, 0.6);
   }
 }
@@ -238,6 +242,29 @@
 #intention-root .int-stat-value { color: var(--text-muted); font-weight: 600; }
 #intention-root .int-stat-label { color: var(--text-dim); }
 
+/* Coaching credit, above the conversation. Muted prose in the ordinary case
+   because a healthy balance is a fact and not an announcement; a bordered
+   amber chip once it is running low, which is the same tinted fill + border +
+   text of one hue that every other status in the app uses.
+
+   Amber and not raspberry, deliberately: nothing has failed. Zero credit is a
+   different state entirely and never reaches this element — it is locked, and
+   the paywall replaces the conversation instead. */
+#intention-root .int-credit-note {
+  margin: 0 0 22px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+#intention-root .int-credit-note.int-credit-note-low {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-control);
+  background: var(--warning-fill);
+  color: var(--warning-text);
+}
+
 /* System note: machinery speaking (a clamped grant, a cap hit), not the coach. */
 #intention-root .int-msg.int-system {
   align-self: center;
@@ -248,6 +275,35 @@
   color: var(--success-text);
   font-size: 13px;
   padding: 6px 12px;
+}
+
+/* The drift screen: they are still inside a page-scoped pass, but this is not
+   the page it was for. Deliberately styled as a continuation of the pass and
+   not as an error - no danger hue anywhere - because nothing has gone wrong:
+   the block came back exactly when they were told it would. */
+#intention-root .int-drift-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  margin-top: 6px;
+}
+
+/* Coarse pointers get the 44px target without the painted control growing:
+   the button keeps its size, the box around it does not. */
+@media (pointer: coarse) {
+  #intention-root .int-drift-actions button {
+    min-height: 44px;
+  }
+}
+
+#intention-root .int-drift-note {
+  margin: 26px 0 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 /* Walk-away moment: one full-screen line before the page goes. */
@@ -284,9 +340,25 @@
   font-family: 'Arvo', Georgia, 'Times New Roman', serif;
   font-size: 13px;
   font-weight: 500;
+  line-height: 1.35;
   box-shadow: 0 2px 14px var(--scrim);
   border: 1px solid var(--border);
   pointer-events: auto;
+}
+
+/* What a page-scoped pass is FOR, above the clock. The micro-label: 10px,
+   bold, uppercase, 0.15em tracking, muted - the same device the gate's own
+   eyebrow uses, because it is doing the same job. Absent entirely on a
+   site-wide pass, which is the state every pass was in before scoping
+   existed. */
+#intention-badge-scope {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 #intention-badge-finish {

@@ -80,7 +80,18 @@ const CONFIG_KEYS = [
   // Safari extension process), so the entitlement it mints has to reach the
   // extension through this bridge or the extension's coach stays locked.
   'entitlement',
-  'setupComplete'
+  'setupComplete',
+  // The cool-off the user put on removing Intention. It rides this bridge
+  // because on Apple platforms the settings page the user changes it on is the
+  // one inside the app, not the one inside the extension, and the two have to
+  // agree about a number the coach quotes back at them.
+  //
+  // `leaveRequest` and `leaveStandDown` deliberately do NOT ride it. They are
+  // per-device state — this browser's clock, this device's fifteen minutes of
+  // silence — and syncing them would mean a stand-down earned on a Mac
+  // silencing the interposition on an iPhone, which is not what either of them
+  // means.
+  'leaveDelayMinutes'
 ];
 const NATIVE_APP_ID = 'com.intention.app'; // ignored by Safari (single native host per app)
 const NATIVE_PULL_THROTTLE_MS = 30000;
@@ -202,12 +213,21 @@ async function recordGrant(domain, minutes, reason, options) {
   // quick checks as normal grants, which would rewrite the usage log and the
   // history the coach reasons from. Please don't "tidy" them away.
   const quickCheck = !!(options && options.quickCheck);
+  // Which KIND of pass this was. Lazily added exactly like the flag above and
+  // for the same reason: a page-scoped pass and a site pass are the same one
+  // grant out of the day's allowance, so nothing about the tallies changes —
+  // but "12 minutes granted, 3 used, left the page it was for" and "12
+  // granted, 3 used, closed early" are different stories, and the coach reads
+  // this list as its evidence for what the next ask deserves. Absent means
+  // site-wide, so no migration and no rewrite of banked history.
+  const scoped = !!(options && options.scope);
   await withDailyStats((stats, today) => {
     if (!stats[today][domain]) stats[today][domain] = { minutes: 0, grants: 0, sessions: [] };
     if (quickCheck) stats[today][domain].quickChecks = (stats[today][domain].quickChecks || 0) + 1;
     else stats[today][domain].grants += 1;
     const session = { grantedMinutes: minutes, reason, grantedAt: Date.now() };
     if (quickCheck) session.quickCheck = true;
+    if (scoped) session.scope = 'page';
     stats[today][domain].sessions.push(session);
   });
 }
@@ -314,6 +334,9 @@ async function getStatsForDomain(domain) {
               usedMinutes: typeof s.usedMinutes === 'number' ? s.usedMinutes : null,
               outcome: s.outcome || null,
               quickCheck: !!s.quickCheck,
+              // null rather than undefined for a session banked before scoped
+              // passes existed, so renderSessionsToday reads one shape.
+              scope: s.scope || null,
               // Without this the "back Nm later" annotation in prompts.js had
               // nothing to compute a gap from — stampSessionOutcome writes
               // endedAt, but the mapping here silently dropped it.

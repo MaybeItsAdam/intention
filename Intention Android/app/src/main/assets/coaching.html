@@ -50,6 +50,30 @@
       color: var(--ink);
     }
 
+    /* Third copy of the overlay's credit line (content.css and content.js's
+       OVERLAY_CSS literal are the other two). Unprefixed here because this
+       page has no #intention-root to scope to.
+
+       `data-persistent` on the div is what makes gate-ui.js show the balance
+       on this page even when it is healthy: the app's coaching page IS the
+       screen, so the number belongs on it, where in the content overlay the
+       same line would be one more thing on top of a page the user was already
+       stopped from reading. */
+    .int-credit-note {
+      margin: 0 0 22px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .int-credit-note.int-credit-note-low {
+      align-self: flex-start;
+      padding: 6px 12px;
+      border: 1px solid var(--warning-line);
+      border-radius: var(--radius-control);
+      background: var(--warning-fill);
+      color: var(--warning-text);
+    }
+
     .int-stats-row {
       display: none;
       flex-wrap: wrap;
@@ -270,6 +294,7 @@
 <body>
   <div class="int-column">
     <h1 class="int-heading" id="int-heading">Why are you here?</h1>
+    <div class="int-credit-note" id="int-credit-note" data-persistent hidden></div>
     <div class="int-stats-row" id="int-stats-row"></div>
     <div class="int-messages" id="int-messages"></div>
     <div id="int-paywall" hidden></div>

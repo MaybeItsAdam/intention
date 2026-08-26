@@ -80,9 +80,20 @@ export function makeMockChrome(seed = {}) {
 
   const local = makeStorageArea(store);
 
+  // Storage-change listeners. Only content.js registers one today (a part rule
+  // edited in another tab, which nothing else can deliver to an open page),
+  // and nothing fires it by itself — `chrome.storage._fireChange(changes,
+  // area)` is how a test plays the browser's part.
+  const changeListeners = [];
+
   const chrome = {
     storage: {
       local,
+      onChanged: { addListener: (fn) => changeListeners.push(fn) },
+      _changeListeners: changeListeners,
+      _fireChange: (changes, area = 'local') => {
+        for (const fn of changeListeners) fn(changes, area);
+      },
       // expose the raw backing store for assertions
       _store: store
     },
@@ -323,10 +334,15 @@ export function loadBackground({ seed = {}, fetch, sessionArea = false, native =
     chrome.storage._sessionStore = sessionStore;
   }
 
-  const listeners = { alarm: null, tabRemoved: null, message: null, beforeNavigate: null, committed: null };
+  const listeners = { alarm: null, tabRemoved: null, message: null, beforeNavigate: null, committed: null, historyStateUpdated: null, tabUpdated: null };
   chrome.webNavigation = {
     onBeforeNavigate: { addListener: (fn) => { listeners.beforeNavigate = fn; } },
-    onCommitted: { addListener: (fn) => { listeners.committed = fn; } }
+    onCommitted: { addListener: (fn) => { listeners.committed = fn; } },
+    // The in-page navigation an SPA makes with history.pushState: no request,
+    // nothing commits, and onCommitted never fires. It is the navigation a
+    // page-scoped pass exists to notice, so a mock without it would let a
+    // test believe the background had told the tab something it never did.
+    onHistoryStateUpdated: { addListener: (fn) => { listeners.historyStateUpdated = fn; } }
   };
   const alarms = [];
   chrome.alarms = {
@@ -349,22 +365,65 @@ export function loadBackground({ seed = {}, fetch, sessionArea = false, native =
   // as closed, which is one of the cases the backstop has to stand down for.
   const tabsById = {};
   const tabUpdates = [];
+  const tabMessages = [];
+  const tabCreates = [];
+  // What chrome.tabs.query answers. Empty by default, which is what
+  // focusOrCreateTab's "no tab like this is open" path needs; a test that
+  // wants the other path pushes a tab onto it.
+  const queryResults = [];
   chrome.tabs = {
-    query: async () => [],
+    query: async () => queryResults.slice(),
     get: async (id) => {
       if (!(id in tabsById)) throw new Error('No tab with id: ' + id);
       return tabsById[id];
     },
     update: async (id, props) => { tabUpdates.push({ id, props }); },
-    create: async () => {},
+    create: async (props) => { tabCreates.push(props); return { id: 900 + tabCreates.length, ...props }; },
     remove: () => {},
-    sendMessage: async () => { throw new Error('no content script'); },
+    // Recorded rather than thrown away: the SPA-navigation listener fires a
+    // message at the tab, and whether it did is the assertion.
+    //
+    // The two call shapes answer differently, as the real API does. Awaited
+    // with no callback, it rejects — that is a tab with no content script,
+    // which the check-in path has to survive. Called with a callback, it
+    // reports the same failure through runtime.lastError instead of throwing,
+    // so the callback simply fires; that is the fire-and-forget shape.
+    sendMessage: (id, message, cb) => {
+      tabMessages.push({ id, message });
+      if (typeof cb === 'function') {
+        cb();
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error('no content script'));
+    },
     onRemoved: { addListener: (fn) => { tabRemovedListeners.push(fn); } },
+    // The signal the leaving interposition runs on. webNavigation does not
+    // fire for chrome:// URLs, so this is the ONLY event that can tell the
+    // worker the user is looking at the page they remove us from — a mock
+    // without it would let a test believe the listener had been offered a
+    // navigation it never saw.
+    onUpdated: { addListener: (fn) => { listeners.tabUpdated = fn; } },
     _byId: tabsById,
-    _updates: tabUpdates
+    _updates: tabUpdates,
+    _messages: tabMessages,
+    _creates: tabCreates,
+    _queryResults: queryResults
   };
   chrome.windows = { update: async () => {} };
   chrome.action = { onClicked: { addListener: () => {} } };
+  // Present without the "management" permission, which is the whole reason
+  // this is the removal route we can use: uninstallSelf() needs no permission,
+  // while management.onDisabled/onUninstalled (which would need one, and would
+  // add an install-time warning) can never observe our own removal anyway.
+  const uninstallCalls = [];
+  chrome.management = {
+    uninstallSelf: async (options) => { uninstallCalls.push(options ?? null); },
+    _uninstallCalls: uninstallCalls
+  };
+  // Fire-and-forget in the browser; recorded here so a test can assert the
+  // farewell page is registered and, more importantly, that it is not pointed
+  // at Intention's own backend (which would make it an uninstall ping).
+  chrome.runtime.setUninstallURL = (url) => { chrome.runtime._uninstallURL = url; };
   chrome.runtime.onInstalled = { addListener: () => {} };
   chrome.runtime.onMessage = { addListener: (fn) => { listeners.message = fn; } };
   chrome.runtime.openOptionsPage = () => {};

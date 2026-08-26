@@ -590,6 +590,144 @@ input[type="number"].inline-limit-input.row-timeline-number {
   line-height: 1.5;
 }
 
+/* ---- Parts of the site (buildRowPartsField) -------------------------------
+
+   Its own band under a hairline, like the timeline above it: the question is
+   "which bits of this site", which is a different question from the numbers on
+   the strip and deserves its own line rather than a fourth field squeezed onto
+   theirs.
+
+   The scope toggle reuses .row-mode-toggle wholesale — it is the same
+   component doing the same job one row up (a segmented set where the selected
+   one is marked by the brand tint and nothing moves), and a second set of
+   rules that merely looked like it would be two things to keep in step. Only
+   the three-across wrap is new. */
+.row-parts-field {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-muted);
+  gap: 8px;
+}
+
+/* Three segments, not two: at 320px "All except" no longer fits beside the
+   other two, so the group is allowed to wrap and the children round their own
+   outer corners as .row-mode-btn already does. */
+.row-scope-toggle {
+  flex-wrap: wrap;
+}
+
+.row-parts-helper {
+  max-width: 34em;
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* How an in-app rule fails, said under the rule itself. A hairline in the
+   margin rather than a filled well: it is a caveat on the sentence above it,
+   not a second note, and the row already carries one recessed panel behind the
+   info button. Borders do the work. */
+.row-parts-caveat {
+  margin-top: 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border-input);
+}
+
+/* Where sections cannot work at all — an iOS app, or an Android package the
+   shipped table cannot see inside of. This one IS a well: it replaces the
+   control rather than qualifying it, so it should read as the field's whole
+   content. */
+.row-parts-unavailable {
+  margin-top: 0;
+}
+
+.row-parts-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.row-parts-chips:empty { display: none; }
+
+/* A chip is a pill with a hairline, in the neutral spine — a part is a fact
+   about the rule, not a status, so it takes no accent colour. */
+.row-part-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 11px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-pill);
+  background: var(--well);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.row-part-chip-remove {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.row-part-chip-remove:hover {
+  background: var(--hover);
+  color: var(--danger-text);
+}
+
+/* Sized to its text and left-aligned under the chips: it is the smaller of the
+   two ways to change this rule (the scope toggle is the other), and a
+   full-width button would read as the band's primary action. */
+.row-parts-add {
+  align-self: flex-start;
+  width: auto;
+  margin: 2px 0 0;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* ---- The part picker (openPartPicker) ------------------------------------
+
+   Built in JS and appended to <body>, so it borrows .add-modal / .coach-box /
+   .add-modal-box from the two dialogs it sits beside and adds only what is
+   genuinely its own. */
+.part-picker-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.part-picker-option[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.part-picker-note {
+  margin: 0 0 12px;
+}
+
+.part-picker-param {
+  margin-bottom: 12px;
+}
+
+/* The site's own notation ('r/', '@') shown as part of the field rather than
+   as a word in the placeholder, so what you type is exactly the argument. */
+.part-picker-prefix {
+  flex-shrink: 0;
+  padding-right: 2px;
+  color: var(--text-muted);
+  font-size: 16px;
+}
+
 /* ---- The two site-specific answers (buildRowReasonFields) ----------------
 
    The last band of the row card, under its own hairline. Out of the collapsed
@@ -697,6 +835,101 @@ blockquote {
    it doesn't sit in the same card as the list it empties. */
 .danger-card { border-color: var(--danger-line); }
 .danger-card h2 { color: var(--danger-text); }
+
+/* ---- Leaving Intention -------------------------------------------------- */
+
+/* Deliberately NOT .danger-card. Leaving is not a destructive act to be warned
+   away from with a raspberry hairline — it is a decision the product says out
+   loud it cannot stop, and dressing it as danger would be the same guilt-trip
+   the copy inside refuses to make. An ordinary card, with the exit spelled out
+   plainly. */
+.leaving-card .micro-label { margin-top: 18px; }
+
+/* Full width, and NOT in a well. .row-info-note's default recessed surface is
+   --well, and muted text on --well measures 4.4:1 — under AA. On a row that
+   is a short label nobody has to read; here it is two paragraphs explaining
+   how leaving works, which is the last text in this product that may be hard
+   to read. On the card's raised surface the same muted ink clears it, and the
+   hairline still does the separating. tests/smoke/contrast.smoke.mjs is what
+   caught this and is what will catch it again. */
+.leaving-card .row-info-note {
+  max-width: none;
+  background: transparent;
+}
+
+/* The cool-off ladder. Pills, because these are four mutually exclusive
+   choices and .pill.selected is already how this page paints "this one". */
+.leave-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 0;
+}
+
+/* Weight, not colour, carries the two lines apart. The detail line underneath
+   would be the natural place for muted ink, but a pill's fill is --well and
+   muted-on-well is 4.4:1 — so the hierarchy is expressed the way the house
+   style prefers anyway: same ink, different weight and size. */
+.leave-choice {
+  text-align: left;
+  font-weight: 700;
+}
+
+/* The second line on each pill — "Ask now, remove tomorrow" — which is what
+   makes the ladder a set of consequences rather than a set of numbers. */
+.leave-choice-detail {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink);
+  margin-top: 2px;
+}
+
+/* A request in flight: asked for, waiting out its cool-off. Amber rather than
+   raspberry — this is pending, not wrong. */
+.leave-pending {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-control);
+  background: var(--warning-fill);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Once the cool-off has run out the same block is an open door, not a wait. */
+.leave-pending.leave-ready {
+  border-color: var(--success-line);
+  background: var(--success-fill);
+}
+
+.leave-pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.leave-pending-actions button { flex: 1 1 auto; }
+
+#leave-remove-row { margin-top: 18px; }
+
+/* The exit inside the leaving conversation. Full width and hard against the
+   bottom of the modal, below the input rather than beside the Cancel button:
+   it is not a variant of "close this", it is the other thing you can do here.
+   Enabled from first paint and never hidden once shown — options-coach.js
+   never disables it and never puts it on a timer. */
+.gate-leave-anyway {
+  width: 100%;
+  margin-top: 10px;
+  border-color: var(--danger-line);
+  color: var(--danger-text);
+}
+
+.gate-leave-anyway:hover {
+  background: var(--danger-fill);
+}
 
 #coach-modal, #gate-modal, #add-site-modal, #add-app-modal, #paywall-modal {
   position: fixed;
@@ -1036,7 +1269,7 @@ blockquote {
   margin-top: 12px;
 }
 
-/* ---- Per-service questions (one section, repainted per service) ---- */
+/* ---- Per-service questions (one screen, one card per service) ---- */
 
 /* The signature micro-label: hierarchy from surface and position, not from
    font size. Section eyebrows, column headers and chip captions all use it. */
@@ -1049,47 +1282,194 @@ blockquote {
   color: var(--text-muted);
 }
 
-.setup-purpose-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.setup-purpose-head h3 {
-  margin: 0;
-}
-
 /* Brand glyph where the catalogue has one, the service's initial where it
    doesn't — a hand-typed domain still gets a mark rather than a gap. */
-.setup-purpose-mark, .row-mark {
+.setup-service-mark, .row-mark {
   flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--border);
   background: var(--raised);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 15px;
+  font-size: 12px;
   font-weight: 700;
   color: var(--ink);
 }
 
-.setup-purpose-mark svg, .row-mark svg {
-  width: 17px;
-  height: 17px;
+.setup-service-mark svg, .row-mark svg {
+  width: 15px;
+  height: 15px;
   fill: var(--ink);
+}
+
+/* The stack: one bordered panel, hairline-divided, rather than a card each.
+   Cards-on-cards is the thing this design language does not do, and a list of
+   eight services has to read as one list. */
+.setup-service-stack {
+  list-style: none;
+  margin: 14px 0 4px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+
+.setup-service + .setup-service {
+  border-top: 1px solid var(--border);
+}
+
+.setup-service-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  background: none;
+  border: none;
+  text-align: left;
+  color: var(--ink);
+}
+
+.setup-service-name {
+  flex: 1 1 auto;
+  min-width: 6ch;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setup-service-state {
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+/* Answered is the only state that earns a colour. "Blocked outright" keeps the
+   muted micro-label: it is an answer, not an achievement. */
+.setup-service-state.answered {
+  color: var(--success-text);
+}
+
+/* A CSS-only caret, so the collapsed rows carry no SVG each. */
+.setup-service-chev {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+  transform: rotate(45deg);
+  margin: -4px 4px 0 0;
+  transition: transform 0.18s ease;
+}
+
+.setup-service-head[aria-expanded="true"] .setup-service-chev {
+  transform: rotate(225deg);
+  margin: 2px 4px 0 0;
+}
+
+.setup-service-body {
+  padding: 0 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* .setup-service-body sets display:flex, which outranks the UA sheet's
+   [hidden] { display: none } — the same trap the setup checklists hit. */
+.setup-service-body[hidden] {
+  display: none;
+}
+
+.setup-service-members {
+  margin-bottom: 4px;
+}
+
+/* Same line treatment as .model-pills: a wrapping row of chips, not a grid. */
+.answer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 8px;
+}
+
+/* The optional refinement's reveal. Quiet on purpose — the chips are the
+   answer, and this is the exception for the person who has something specific
+   to say. */
+.setup-service-note-toggle {
+  align-self: flex-start;
+  padding: 4px 0;
+  background: none;
+  border: none;
+  color: var(--primary-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.setup-service-note {
+  width: 100%;
+  margin-bottom: 4px;
+}
+
+/* What the coach will do with the taps, updated as they happen. A well rather
+   than a card, with the accent only on the leading edge: it is a consequence
+   of what is directly above it, not a second thing to read. */
+.setup-service-preview {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  background: var(--well);
+  border: 1px solid var(--border);
+  border-left: 1px solid var(--primary-line);
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+
+.setup-service-next {
+  align-self: flex-start;
+}
+
+/* The stack's own progress, distinct from the wizard's: that bar says where
+   you are in setup, this says how much of THIS is left. Thinner, because it is
+   the smaller of the two claims. */
+.setup-substep {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 4px;
+}
+
+.setup-substep[hidden] {
+  display: none;
+}
+
+.setup-substep-track {
+  flex: 1;
+  height: 3px;
+  background: var(--hover);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+
+.setup-substep-fill {
+  height: 100%;
+  width: 0;
+  background: var(--primary-solid);
+  border-radius: var(--radius-pill);
+  transition: width 0.25s ease;
 }
 
 /* A step down from the wizard's: a list of twenty of these is a texture, and
    the mark is there to be recognised, not counted. */
-.row-mark { width: 28px; height: 28px; font-size: 12px; }
 .row-mark svg { width: 15px; height: 15px; }
 
-/* Skips the whole run, not one screen — deliberately quiet, and deliberately
-   not next to Next, so it reads as the way out rather than the way on. */
+/* Deliberately quiet, and deliberately not next to Next, so it reads as the
+   way out rather than the way on — saying "these are optional" out loud is
+   what stops a stack of cards reading as a wall to climb. */
 .setup-purpose-skip {
   margin-top: 4px;
   font-size: 13px;
@@ -1585,6 +1965,12 @@ input[type="number"].inline-limit-input:focus {
   }
 
   .pill { padding: 6px 12px; }
+
+  /* The head is a 44px row of its own on a phone, and the state chip drops
+     under the name at the narrow end rather than squeezing it — the same
+     treatment .row-head gets, for the same reason. */
+  .setup-service-head { padding: 14px; }
+  .setup-service-name { flex-basis: calc(100% - 46px); }
 
   .recommend-card { padding: 8px 10px 8px 12px; }
 

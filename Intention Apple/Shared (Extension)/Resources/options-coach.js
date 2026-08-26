@@ -185,7 +185,19 @@ let gateRequestSeq = 0;
 // access a gate conversation does — without it, show the paywall rather than a
 // chat box that can only fail.
 async function openGateModal({ changeType, domain, isApp, appLabel, currentValue, newValue, title, subtitle, onApproved }) {
-  if (!(await requireAccess())) return;
+  // Every gate but one refuses to open without AI access, and shows the
+  // paywall instead — a chat box that can only fail is worse than a clear
+  // "you need credit for this".
+  //
+  // Leaving is the exception, and it has to be. A user who has run out of
+  // coaching credit is precisely the user most likely to want out, and putting
+  // a paywall between them and the exit would be the ugliest thing this
+  // product could do: pay us to be allowed to leave. So the leaving
+  // conversation opens regardless. Without a coach it cannot be *approved* —
+  // there is nobody to approve it — but "Remove it anyway" below the messages
+  // works exactly as it always does, which is the way out this feature
+  // promises is always there.
+  if (changeType !== 'uninstall' && !(await requireAccess())) return;
   gateChange = { changeType, domain, isApp, appLabel, currentValue, newValue, onApproved };
   const modal = document.getElementById('gate-modal');
   modal.hidden = false;
@@ -213,7 +225,11 @@ async function openGateModal({ changeType, domain, isApp, appLabel, currentValue
   };
   send.onclick = onSend;
   input.onkeydown = e => { if (e.key === 'Enter') onSend(); };
-  document.getElementById('gate-close-btn').onclick = closeGateModal;
+  // Wrapped rather than passed by reference: closeGateModal takes the outcome
+  // of the conversation, and handing it the click Event instead would record
+  // an outcome of "[object MouseEvent]".
+  document.getElementById('gate-close-btn').onclick = () => closeGateModal('declined');
+  applyLeavingGateChrome(changeType, currentValue);
 
   // Same reason as openCoachModal: closing the options tab skips
   // closeGateModal's transcript delete, so clear before the opener rather
@@ -239,8 +255,59 @@ const GATE_OPENER_FALLBACKS = {
   increase_app_loose_window: (d) => `You want me to go easy on you for longer on ${d}. What's behind that?`,
   edit_site_purpose: (d) => `You want to change what you told me ${d} is for. Talk me through what's different now.`,
   edit_site_legitimate: (d) => `You want to change what counts as a legitimate reason to open ${d}. Tell me why the old wording is wrong.`,
-  disable_all: () => `You want to turn off all blocking. That's a big move. Talk to me about what's going on.`
+  // Both scope types, because the fallback is what the user reads when the
+  // network drops on the way to the coach — and "you want to loosen your
+  // rules" would be the only thing ever said about a change that is really
+  // "leave the messages open, keep Reels shut".
+  narrow_block_scope: (d) => `You want to leave part of ${d} open — blocked everywhere except the bits you name. Which part, and what is it you need there?`,
+  narrow_app_block_scope: (d) => `You want to leave part of ${d} open — blocked everywhere except the bits you name. Which part, and what is it you need there?`,
+  disable_all: () => `You want to turn off all blocking. That's a big move. Talk to me about what's going on.`,
+  // The offline fallback matters more here than anywhere else in this map: it
+  // is what somebody sees when the network drops on their way out, and the
+  // only thing worse than a coach that begs is a blank box in front of the
+  // exit. It says the same thing the prompt does — I can't stop you, tell me
+  // what happened — because those are the words the product stands behind
+  // whether or not the model ever answers.
+  uninstall: () => `You're about to take Intention off this device. I can't stop you and I'm not going to try — but tell me what happened first.`,
+  decrease_leave_delay: () => `You want to shorten the wait you put on removing Intention. You chose that number for a moment like this one. What's changed?`
 };
+
+// The leaving conversation's own chrome: the exit, and the relabelled Cancel.
+//
+// Two properties this function exists to make legible, both of which are
+// load-bearing rather than stylistic:
+//
+//   * The exit is enabled on the FIRST paint of the modal — before the coach
+//     has said anything, before the network has been touched — and nothing
+//     anywhere disables it, hides it again or puts it behind a timer. A
+//     self-control tool whose exit arrives late is a tool that has decided it
+//     knows better than you, and the copy elsewhere promises it does not.
+//   * "Cancel" is the wrong word on a conversation somebody opened by
+//     accident, which on Chrome is a real case: the interposition fires on any
+//     visit to chrome://extensions, including one to manage a different
+//     extension. "I was here for something else" is what actually happened.
+function applyLeavingGateChrome(changeType, leaveDelayMinutes) {
+  const exit = document.getElementById('gate-leave-anyway-btn');
+  const close = document.getElementById('gate-close-btn');
+  if (!exit || !close) return;
+  if (changeType !== 'uninstall') {
+    exit.hidden = true;
+    exit.onclick = null;
+    close.textContent = 'Cancel';
+    return;
+  }
+  const delay = formatLeaveDelay(leaveDelayMinutes);
+  exit.textContent = delay
+    ? `Remove it anyway — this ends your ${delay} cool-off`
+    : 'Remove it anyway';
+  exit.disabled = false;
+  exit.hidden = false;
+  exit.onclick = async () => {
+    await closeGateModal('anyway');
+    await finishRemoval();
+  };
+  close.textContent = 'I was here for something else';
+}
 
 function gateOpenerFallback(changeType, domain) {
   const fallback = GATE_OPENER_FALLBACKS[changeType];
@@ -281,7 +348,11 @@ async function attemptGateOpen() {
   gateSending = false;
   if (!resp || resp.error) {
     thinking.remove();
-    if (resp && resp.locked) {
+    // Locked means no coaching credit. Everywhere else that hands over to the
+    // paywall; on the way out it must not, or the exit closes behind a
+    // purchase. The offline opener says the honest thing and the "Remove it
+    // anyway" button below it still works.
+    if (resp && resp.locked && changeType !== 'uninstall') {
       await closeGateModal();
       await openPaywallModal();
       return;
@@ -330,7 +401,9 @@ async function attemptGateSend(text, messagesEl) {
   }
   if (resp.error) {
     thinking.remove();
-    if (resp.locked) {
+    // Same exception as attemptGateOpen: the leaving conversation never hands
+    // over to the paywall, because the exit beside it has to keep working.
+    if (resp.locked && gateChange && gateChange.changeType !== 'uninstall') {
       await closeGateModal();
       await openPaywallModal();
       return;
@@ -347,7 +420,7 @@ async function attemptGateSend(text, messagesEl) {
     const cb = gateChange.onApproved;
     setTimeout(async () => {
       if (cb) await cb();
-      closeGateModal();
+      closeGateModal('approved');
     }, 900);
   }
 }
@@ -360,11 +433,20 @@ function showGateRetryableError(messagesEl, message, text) {
   });
 }
 
-async function closeGateModal() {
+// `outcome` is one of background.js's LEAVE_OUTCOMES and matters only for the
+// leaving conversation, where EVERY ending — approved, declined, cancelled,
+// "remove it anyway" — buys fifteen minutes of silence from the browser
+// interposition. Including a decline, and that is the whole anti-loop
+// property: decide to stay, go back to the extensions page for whatever you
+// actually opened it for, and Intention says nothing.
+async function closeGateModal(outcome) {
   const modal = document.getElementById('gate-modal');
   modal.hidden = true;
   if (gateChange) {
     const historyKey = `settings_gate:${gateChange.changeType}:${gateChange.domain || 'all'}`;
+    if (gateChange.changeType === 'uninstall') {
+      await sendBg({ action: 'beginLeave', reason: outcome || 'declined' });
+    }
     await sendBg({ action: 'clearChatHistory', historyKey });
   }
   gateChange = null;

@@ -254,6 +254,19 @@
           <div id="ios-apps-controls" hidden>
             <p class="subtitle" id="ios-apps-status"></p>
             <button id="ios-authorize-btn" class="secondary" style="width: 100%; margin-bottom: 8px;" hidden>Enable Screen Time access</button>
+            <!-- Site rows carry a "Parts of the site" control and app rows do
+                 not, and on iOS that gap is permanent rather than pending. A
+                 Screen Time shield takes an opaque ApplicationToken and hides
+                 the whole app; there is no screen, tab or deep-link
+                 granularity in the API and no way for any third party to read
+                 another app's view hierarchy. Saying so here, on the card
+                 itself, is the point — a user who reads about parts on the
+                 Websites tab will otherwise assume it applies to both.
+                 The alternative it points at is real: webDomainTokens are a
+                 separate set from applicationTokens, so shielding the app
+                 while leaving the site reachable in Safari is expressible, and
+                 our own part rules then do the fine-grained work there. -->
+            <p class="row-info-note" id="ios-apps-parts-note">Parts of an app can’t be blocked on iPhone or iPad. Screen Time blocks a whole app or nothing, and Apple gives Intention no way to see which screen you’re on. If you want Reels blocked but messages open, block the Instagram app here and add instagram.com on the Websites tab — Safari runs Intention’s own rules, which can tell the parts apart.</p>
           </div>
         </section>
 
@@ -262,6 +275,32 @@
           <p class="subtitle">Stops Intention blocking anything at all — every website and every app on your lists, in one go. Your lists are kept, so you can turn it back on later.</p>
           <button id="disable-all-btn" class="secondary" style="width: 100%;">Turn off all blocking</button>
           <div id="disable-all-status" class="status"></div>
+        </section>
+
+        <!-- Leaving Intention. Sits below "Turn everything off" because that is
+             the order the two decisions come in: almost everyone who thinks
+             they want this wants that instead, and putting it second means
+             they read the cheaper option first.
+
+             Everything inside is built by options.js with createElement /
+             textContent — the delay choices, the pending-request line, the
+             Apple instructions. The markup here is the frame only. -->
+        <section class="card leaving-card" id="leaving-card" data-section="blocking">
+          <h2>Leaving Intention</h2>
+          <p class="subtitle">Removing Intention is always possible. No app can really stop you, and this one isn’t going to pretend otherwise. What it can do is make sure the decision gets made by whoever is reading this now, rather than by whoever is holding the phone at 11pm.</p>
+
+          <p class="micro-label">Cool-off before removal</p>
+          <div id="leave-delay-choices" class="leave-choices" role="group" aria-label="Cool-off before removal"></div>
+          <p class="row-info-note" id="leave-delay-note">Making the delay longer saves straight away. Shortening it means convincing your coach, same as any other rule you set for yourself.</p>
+
+          <div id="leave-pending" class="leave-pending" hidden></div>
+
+          <p class="micro-label">Take your list with you</p>
+          <p class="row-info-note">A small file holding your blocked sites and apps, your limits, your answers and your coach’s context. If you ever remove Intention and come back, it is a record of what you had set up, so you can put it back rather than starting from a blank page. There is no import button yet — you would re-enter it by hand. It does not contain your API key, your coaching credit or your usage history.</p>
+          <button type="button" id="export-list-btn" class="secondary" style="width: 100%;">Save a copy of your list</button>
+
+          <div id="leave-remove-row"></div>
+          <div id="leaving-status" class="status"></div>
         </section>
 
         <section class="card" id="unlock-card" data-section="unlock" hidden>
@@ -377,6 +416,15 @@
           <input type="text" id="gate-input" placeholder="Make your case...">
           <button id="gate-send-btn" class="primary">Send</button>
         </div>
+        <!-- The exit, for the leaving conversation only.
+             It is in the markup rather than created on demand so that it can
+             never be late: it is enabled on first paint, it is never put
+             behind a timer, and the only thing options-coach.js does to it is
+             unhide it and write its label. A coach that could withhold this
+             would make Intention the thing it exists to be an alternative to,
+             and it would be a lie besides — the browser's own Remove button is
+             two clicks away the whole time. -->
+        <button type="button" id="gate-leave-anyway-btn" class="secondary gate-leave-anyway" hidden>Remove it anyway</button>
       </div>
     </div>
 

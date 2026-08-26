@@ -2,8 +2,14 @@
 //
 // Everything from "what do you want blocked" to the first render of the
 // settings page: the wizard's own draft state, its per-service questions, the
-// step order (computed rather than a fixed list, because there is one screen
-// per service selected), and the save that ends it.
+// step order, and the save that ends it.
+//
+// The step order is a plain list of section ids and its length depends on the
+// build, never on the blocklist. It briefly wasn't: the per-service questions
+// were one STEP each, so picking six services produced six near-identical
+// screens and moved the "Step N of M" denominator every time a site was added
+// on the step before. They are now one step that iterates the services inline,
+// which is what makes that denominator a constant again.
 //
 // The state below is module-level `let` on purpose. A classic script's
 // top-level bindings are shared with every other script the page loads, so
@@ -16,14 +22,26 @@ let setupDomainLimits = {};
 let setupBlockedApps = [];
 let setupAppLimits = {};
 let setupAppLabels = {};
-// { [serviceKey]: { purpose, legitimateUse } } — keyed by serviceKeyFor(), so a
-// site and its app share one answer. See shared/sites.js.
-let setupServiceReasons = {};
+// { [serviceKey]: { needs: string[], costs: string[], needsNote, costsNote } }
+// — keyed by serviceKeyFor(), so a site and its app share one answer. See
+// shared/sites.js.
+//
+// CHIP IDS, not prose. They live in the wizard and its draft only:
+// collectServiceReasons() composes them into the { purpose, legitimateUse }
+// pair that everything downstream — sanitizeServiceReasons,
+// renderSiteReasonBlock, the settings row, the Android and iOS readers — has
+// always been handed. Nothing outside this file and sites.js knows an id
+// exists, which is what let the input change without a storage migration.
+let setupServiceAnswers = {};
+// Which service card on the purpose step is open. Held here rather than read
+// back off the DOM so it survives the rebuild that adding or removing a site
+// triggers, and so a restored draft can reopen where the user left off.
+let setupExpandedService = null;
 let setupStep = 1;
-// Computed per-render, and recomputed whenever the selection changes. Entries
-// are { id, group }: the apps step only exists where a native bridge does, and
-// the purpose steps are one per selected service, so neither the contents nor
-// the length is known up front.
+// Bare section ids, computed once per render. The apps and Safari steps only
+// exist where a native bridge does, so the contents still depend on the build
+// — but not on anything the user does inside the wizard, which is the property
+// that matters. See computeStepOrder.
 let setupStepOrder = [];
 let setupBlockingMode = 'coach';
 let setupSimpleBehavior = 'pass';
@@ -62,13 +80,12 @@ function showSetupView() {
   // nothing to sell. It used to be added and removed as the mode was toggled,
   // which changed the denominator of "Step 4 of 8" under the user's finger.
   //
-  // The per-service questions sit after the global "what are you protecting?"
-  // — the general case, then the specifics — and they stay in the order even
-  // in simple mode, where nothing will read them. Dropping them when there is
-  // no coach is tempting and wrong: it would re-create the bug that put the
-  // access step here unconditionally, where toggling Coach/Simple changed the
-  // denominator of "Step 4 of 8" under the user's finger. The subtitle adapts
-  // instead.
+  // The per-service questions sit directly after the sites step, and they stay
+  // in the order even in simple mode, where nothing will read them. Dropping
+  // them when there is no coach is tempting and wrong: it would re-create the
+  // bug that put the access step here unconditionally, where toggling
+  // Coach/Simple changed the denominator of "Step 4 of 8" under the user's
+  // finger. The subtitle adapts instead.
   setupStepOrder = computeStepOrder();
 
   // ---- Step: welcome ----
@@ -131,7 +148,9 @@ function showSetupView() {
   };
 
   // ---- Step: per-service questions ----
-  wirePurposeStep();
+  // Nothing to wire once: every control on that step belongs to a card that
+  // renderPurposeStack() builds, so the listeners are attached as the cards
+  // are. The step's one fixed control is the skip button, below.
 
   // Hoisted for the same reason as showSetupStep below: restoring a draft has
   // to repaint the mode cards, and it runs outside this closure.
@@ -173,23 +192,25 @@ function showSetupView() {
   const showStep = (n) => {
     setupStep = n;
     const total = setupStepOrder.length;
-    // Hide every distinct section first, then reveal the one. The old
-    // hidden = i !== n - 1 loop cannot survive an id appearing more than once
-    // in the order: a later iteration would re-hide the section an earlier one
-    // had just shown, and the purpose step appears once per service.
-    for (const id of new Set(setupStepOrder.map(s => s.id))) {
+    // Every id in the order is distinct now, so a plain loop is enough again.
+    // It briefly could not be: the purpose section appeared once per service,
+    // and a later iteration re-hid the section an earlier one had just shown.
+    for (const id of setupStepOrder) {
       document.getElementById(id).hidden = true;
     }
-    const step = setupStepOrder[n - 1];
-    document.getElementById(step.id).hidden = false;
+    const stepId = setupStepOrder[n - 1];
+    document.getElementById(stepId).hidden = false;
 
     document.getElementById('setup-progress-fill').style.width = `${(n / total) * 100}%`;
     document.getElementById('setup-progress-label').textContent = `Step ${n} of ${total}`;
     backBtn.disabled = n === 1;
     nextBtn.hidden = n === total;
     saveBtn.hidden = n !== total;
-    const stepId = step.id;
-    if (step.group) renderPurposeStep(step.group);
+    // Rebuilt on arrival rather than kept in sync: the selection can only be
+    // edited on the steps before this one, so there is never a live card to
+    // preserve, and a full repaint is the only way to be sure a service
+    // removed on the way back has no card left behind.
+    if (stepId === 'setup-step-purpose') renderPurposeStack();
     // Prices come from the store, so the paywall is only built once the user
     // actually reaches it — and rebuilt each time, to pick up a purchase made
     // and then backed out of.
@@ -207,14 +228,13 @@ function showSetupView() {
     saveSetupDraft();
   };
 
-  // Skips the whole run of per-service questions, not just this one. Someone
-  // who picked twelve sites needs a way out that isn't twelve taps on Next,
-  // and capping the number of screens would have taken the choice away from
-  // the people who want to answer all twelve.
+  // There is one screen to leave now rather than a run of them, so this is
+  // just Next by another name — but it keeps its own button and its own
+  // wording. "Skip these" says out loud that answering is optional, which is
+  // the thing that stops a long stack of cards reading as a wall to climb;
+  // Next on its own says nothing about whether the blanks matter.
   document.getElementById('setup-purpose-skip-btn').onclick = () => {
-    let n = setupStep;
-    while (n < setupStepOrder.length && setupStepOrder[n].group) n++;
-    showStep(Math.min(n + 1, setupStepOrder.length));
+    showStep(Math.min(setupStep + 1, setupStepOrder.length));
   };
   // Hoisted onto the module scope so the site/app list renderers can re-run the
   // empty-list check after an add or a remove, without reaching into this
@@ -250,26 +270,21 @@ function currentServiceGroups() {
   });
 }
 
-// Step descriptors, not bare ids: the purpose step reuses one section for every
-// service, so an id alone no longer identifies a step.
+// A flat list of section ids, each appearing exactly once.
 //
-// Recomputing is safe at any point during the wizard because the selection can
-// only be edited on the apps and sites steps, which sit before every purpose
-// step — so adding a site lengthens the run ahead of the user, never under
-// their feet.
+// The only thing that varies is the build: browser 6, Android 7, iOS 8. It
+// used to vary with the blocklist too — one purpose step per selected service
+// — which meant the total shown on every screen changed the moment a site was
+// added, and the step had to be stored as an id PLUS a service key because an
+// id no longer identified a step. Both of those are gone. "Step 3 of 6" now
+// means the same thing for the whole run, which is the only version of that
+// counter worth showing.
 function computeStepOrder() {
   const order = ['setup-step-welcome'];
   if (HAS_SAFARI_EXTENSION) order.push('setup-step-safari');
   if (HAS_APP_BLOCKING || HAS_IOS_APP_BLOCKING) order.push('setup-step-apps');
-  order.push('setup-step-sites');
-  const steps = order.map(id => ({ id, group: null }));
-  for (const group of currentServiceGroups()) {
-    steps.push({ id: 'setup-step-purpose', group: group.key });
-  }
-  for (const id of ['setup-step-mode', 'setup-step-access', 'setup-step-done']) {
-    steps.push({ id, group: null });
-  }
-  return steps;
+  order.push('setup-step-sites', 'setup-step-purpose', 'setup-step-mode', 'setup-step-access', 'setup-step-done');
+  return order;
 }
 
 // Finishing with an empty blocklist produces an install that does nothing at
@@ -285,18 +300,16 @@ function refreshSetupNav() {
   if (saveBtn) saveBtn.disabled = !ok;
   if (hint) hint.hidden = ok;
 
-  // Adding or removing a site changes how many per-service questions there
-  // are, so the order has to be rebuilt here — this runs after every add and
-  // remove. Safe mid-wizard: see computeStepOrder.
+  // The order no longer depends on the selection, so this recompute is a no-op
+  // for length and is kept for one honest reason: the apps step's existence
+  // depends on a native bridge that reports asynchronously, so the build can
+  // still learn something after the first render. Re-anchoring on the current
+  // id costs nothing and keeps this correct if that ever grows a second cause.
   if (setupStepOrder.length) {
     const current = setupStepOrder[setupStep - 1];
     setupStepOrder = computeStepOrder();
-    // Removing the service whose screen is open would otherwise leave the step
-    // pointing past the end of the order.
-    if (current) {
-      const index = setupStepOrder.findIndex(s => s.id === current.id && s.group === current.group);
-      if (index !== -1) setupStep = index + 1;
-    }
+    const index = setupStepOrder.indexOf(current);
+    if (index !== -1) setupStep = index + 1;
     setupStep = Math.min(setupStep, setupStepOrder.length);
     const label = document.getElementById('setup-progress-label');
     const fill = document.getElementById('setup-progress-fill');
@@ -319,21 +332,44 @@ const SETUP_DRAFT_KEY = 'setupDraft';
 // the very thing being restored. Nothing is written until the read is done.
 let setupDraftReady = false;
 
+// How long a burst of typing is allowed to run before the draft is written.
+// Long enough that a sentence is one write rather than forty, short enough
+// that putting the phone down mid-sentence still banks it.
+const SETUP_DRAFT_DEBOUNCE_MS = 500;
+let setupDraftSaveTimer = null;
+
+function cancelPendingSetupDraftSave() {
+  if (setupDraftSaveTimer === null) return;
+  clearTimeout(setupDraftSaveTimer);
+  setupDraftSaveTimer = null;
+}
+
+// The deferred form, for callers that fire per keystroke. The answers object
+// is always updated straight away by the caller — this is only about how often
+// that reaches chrome.storage.
+function saveSetupDraftSoon() {
+  cancelPendingSetupDraftSave();
+  setupDraftSaveTimer = setTimeout(saveSetupDraft, SETUP_DRAFT_DEBOUNCE_MS);
+}
+
 function saveSetupDraft() {
+  // Any immediate save subsumes a deferred one: they write the same state, read
+  // at the same moment from the same variables.
+  cancelPendingSetupDraftSave();
   if (!setupDraftReady) return;
-  // The step is stored as an id plus a service key rather than an index: the
-  // order's length now depends on the selection, so an index saved before a
-  // site was added points somewhere else entirely when it is read back.
-  const step = setupStepOrder[setupStep - 1] || null;
+  // The step is stored as an id rather than an index, and that stays true even
+  // though the order is a constant again: an index means nothing across a
+  // build that gained or lost the apps step, and the id costs the same.
+  // `stepGroup` is gone — one section, one step, so an id identifies a step.
   const draft = {
-    stepId: step ? step.id : null,
-    stepGroup: step ? step.group : null,
+    stepId: setupStepOrder[setupStep - 1] || null,
     blockedDomains: setupBlockedDomains,
     domainLimits: setupDomainLimits,
     blockedApps: setupBlockedApps,
     appLimits: setupAppLimits,
     appLabels: setupAppLabels,
-    serviceReasons: setupServiceReasons,
+    serviceAnswers: setupServiceAnswers,
+    expandedService: setupExpandedService,
     blockingMode: setupBlockingMode,
     simpleBehavior: setupSimpleBehavior,
     simplePassMinutes: setupSimplePassMinutes
@@ -342,6 +378,12 @@ function saveSetupDraft() {
 }
 
 function clearSetupDraft() {
+  // A keystroke a moment before Finish leaves a deferred write pending, and it
+  // would land after this remove — re-creating the draft of a wizard that has
+  // just been completed, which puts the next load back into setup. Nothing is
+  // lost by dropping it: finishSetup saves from the answers object, not from
+  // the draft.
+  cancelPendingSetupDraftSave();
   try { chrome.storage.local.remove(SETUP_DRAFT_KEY); } catch (e) {}
 }
 
@@ -365,7 +407,11 @@ async function restoreSetupDraft() {
   setupBlockedApps = Array.isArray(draft.blockedApps) ? draft.blockedApps : [];
   setupAppLimits = draft.appLimits || {};
   setupAppLabels = draft.appLabels || {};
-  setupServiceReasons = draft.serviceReasons || {};
+  // A draft written by the shipped wizard holds prose, not chip ids. Throwing
+  // it away would lose whatever a first-run user typed before they refreshed,
+  // which is the exact situation the draft exists for.
+  setupServiceAnswers = draft.serviceAnswers || migrateLegacyServiceReasons(draft.serviceReasons);
+  if (typeof draft.expandedService === 'string') setupExpandedService = draft.expandedService;
   if (draft.blockingMode === 'simple' || draft.blockingMode === 'coach') setupBlockingMode = draft.blockingMode;
   if (draft.simpleBehavior === 'hard' || draft.simpleBehavior === 'pass') setupSimpleBehavior = draft.simpleBehavior;
   if (Number(draft.simplePassMinutes) > 0) setupSimplePassMinutes = Number(draft.simplePassMinutes);
@@ -382,84 +428,472 @@ async function restoreSetupDraft() {
   renderSetupModeStep();
 
   // A saved step that no longer exists (a build change, a bridge that stopped
-  // reporting, a service since removed from the blocklist) must not leave the
-  // wizard on a blank screen.
+  // reporting) must not leave the wizard on a blank screen. A draft written by
+  // the old wizard may also carry a `stepGroup`; it is simply ignored, and the
+  // id alone resolves.
   if (!draft.stepId) return 1;
-  const index = setupStepOrder.findIndex(s => s.id === draft.stepId && s.group === (draft.stepGroup || null));
+  const index = setupStepOrder.indexOf(draft.stepId);
   return index === -1 ? 1 : index + 1;
 }
 
-// ---- Step: why this one? --------------------------------------------------
-//
-// One section serving N services, so the inputs are wired once and read this
-// to know who they are currently writing about.
-let currentPurposeGroup = null;
-
-function purposeAnswersFor(key) {
-  if (!setupServiceReasons[key]) setupServiceReasons[key] = { purpose: '', legitimateUse: '' };
-  return setupServiceReasons[key];
+// Prose written by the shipped wizard, read back as answers. The two typed
+// fields become the two free-text notes — purpose was "why is it on the list?"
+// and legitimateUse was "when is opening it fair enough?", which is exactly
+// what the notes under each chip row now refine — and no chips are guessed
+// from it. A migrated card therefore renders with its notes already revealed
+// and nothing selected, so nothing typed is lost and nothing is invented.
+function migrateLegacyServiceReasons(reasons) {
+  const out = {};
+  for (const [key, value] of Object.entries(reasons || {})) {
+    out[key] = {
+      needs: [],
+      costs: [],
+      needsNote: String(value?.legitimateUse || '').trim(),
+      costsNote: String(value?.purpose || '').trim()
+    };
+  }
+  return out;
 }
 
-function wirePurposeStep() {
-  const fields = [
-    ['setup-purpose-why-input', 'purpose'],
-    ['setup-purpose-legit-input', 'legitimateUse']
-  ];
-  for (const [id, field] of fields) {
-    const el = document.getElementById(id);
-    // 'change' rather than 'input' for the same reason as the two global
-    // answers: these invite several sentences, and banking a draft on every
-    // keystroke writes to storage far more often than it is worth.
-    el.addEventListener('change', () => {
-      if (!currentPurposeGroup) return;
-      purposeAnswersFor(currentPurposeGroup)[field] = el.value.trim();
+// ---- Step: what is each one for? ------------------------------------------
+//
+// One screen, one card per service, chips instead of textareas.
+//
+// The shape of this step is the whole point of it. The two questions it asks
+// are the single most valuable thing the coach is ever given — the user's own
+// rule, written while calm, which renderSiteReasonBlock hands it at every gate
+// — and as two open textareas repeated once per service they were also the
+// most skipped. Typing two paragraphs about six services on a phone is an
+// interrogation, and an interrogation gets answered with whatever ends it.
+//
+// So: taps. A chip is faster than a sentence, it is structured input the coach
+// can be given verbatim through composeServiceReason(), and it is better prose
+// than most people type under that much friction. Free text stays underneath
+// as an optional refinement, because the one person in ten with something
+// specific to say ("only my sister's messages") is exactly the person whose
+// answer is worth the most.
+//
+// The preview line under each card is not decoration; it is what turns the
+// form back into a purpose. It says what the coach will DO with the taps, in
+// the second person, as they happen. It deliberately promises to "hear you
+// out" rather than to let you through: renderSiteReasonBlock's own closing
+// paragraph exists to stop a stated legitimate use becoming a password, and
+// printing "your coach will let you through for a DM reply" on screen would
+// teach the user to recite their setup answer at the gate — the exact failure
+// that paragraph is written to prevent.
+
+// The answers held for one service, created empty on first touch. Also repairs
+// a migrated draft, which carries the two notes and no arrays at all.
+function serviceAnswersFor(key) {
+  const existing = setupServiceAnswers[key];
+  if (existing) {
+    if (!Array.isArray(existing.needs)) existing.needs = [];
+    if (!Array.isArray(existing.costs)) existing.costs = [];
+    return existing;
+  }
+  setupServiceAnswers[key] = { needs: [], costs: [], needsNote: '', costsNote: '' };
+  return setupServiceAnswers[key];
+}
+
+// '' | 'answered' | 'none'. A note on its own counts: someone who typed a
+// sentence and tapped nothing has answered.
+function serviceAnswerState(key) {
+  const answers = setupServiceAnswers[key];
+  if (!answers) return '';
+  if ((answers.needs || []).includes(NEED_NONE_ID)) return 'none';
+  const anything = (answers.needs || []).length || (answers.costs || []).length ||
+    String(answers.needsNote || '').trim() || String(answers.costsNote || '').trim();
+  return anything ? 'answered' : '';
+}
+
+// "a DM reply or a link someone sent you". Alternatives, so "or" — parts.js
+// has a joinWithAnd for the list of things a rule covers, which is the other
+// relation and would read as a promise to allow all of them at once.
+function joinAlternatives(items) {
+  if (items.length <= 1) return items[0] || '';
+  return `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
+}
+
+// What the coach will do with what has been tapped so far, said back in the
+// second person. Four states, because "nothing yet" and "you told it why but
+// not when" are different situations and pretending otherwise would make the
+// line say something untrue about one of them.
+function previewLineFor(group) {
+  const answers = serviceAnswersFor(group.key);
+  if (answers.needs.includes(NEED_NONE_ID)) {
+    return "Your coach will start every visit from no. You've said there's nothing in here you actually need.";
+  }
+  const phrases = answers.needs
+    .map(id => serviceAnswerChip(group.key, 'needs', id))
+    .filter(chip => chip && chip.you)
+    .map(chip => chip.you);
+  if (phrases.length) {
+    const feed = serviceAnswerCatalogue(group.key).feed;
+    return `Your coach will hear you out for ${joinAlternatives(phrases)} — and push back on ${feed}.`;
+  }
+  if (answers.costs.length) {
+    return `Your coach will know why ${group.label} is on your list, and will ask what you came for.`;
+  }
+  return 'Nothing on file yet. Your coach will just ask what you came for, with nothing of yours to weigh it against.';
+}
+
+// "Nothing — I just want it gone" is exclusive in BOTH directions: picking it
+// clears the reasons, and picking a reason clears it. It is the strongest
+// thing this step can be told and it means nothing sitting next to four
+// reasons the service is fine.
+function toggleServiceChip(key, bucket, chipId) {
+  const answers = serviceAnswersFor(key);
+  const at = answers[bucket].indexOf(chipId);
+  if (at !== -1) {
+    answers[bucket].splice(at, 1);
+    return;
+  }
+  if (bucket === 'needs' && chipId === NEED_NONE_ID) {
+    answers.needs = [NEED_NONE_ID];
+    // The refinement under the chips said when opening it is fair enough, and
+    // the answer is now "never". Leaving it would compose a sentence that
+    // contradicts the one above it.
+    answers.needsNote = '';
+    return;
+  }
+  if (bucket === 'needs') answers.needs = answers.needs.filter(id => id !== NEED_NONE_ID);
+  answers[bucket].push(chipId);
+}
+
+// Opens one card and closes the rest. An accordion rather than a stack of open
+// cards because the collapsed rows are the list of what is left to do, and a
+// list you can see the end of is the thing the old one-step-per-service run
+// could not give.
+function expandService(key) {
+  setupExpandedService = key;
+  const stack = document.getElementById('setup-purpose-stack');
+  for (const li of [...stack.children]) {
+    const open = li.dataset.service === key;
+    li.querySelector('.setup-service-head').setAttribute('aria-expanded', String(open));
+    li.querySelector('.setup-service-body').hidden = !open;
+  }
+  saveSetupDraft();
+}
+
+// "2 of 6 answered" plus its own hairline bar. This measures the stack, not
+// the wizard: the progress bar at the top says where you are in setup, and
+// says nothing about how much of THIS is left — which is the part that reads
+// as endless when it is not shown. One service has no run to describe, so the
+// whole row goes rather than sitting there saying "0 of 1".
+function refreshPurposeProgress() {
+  const count = document.getElementById('setup-purpose-count');
+  const fill = document.getElementById('setup-purpose-fill');
+  const groups = currentServiceGroups();
+  const answered = groups.filter(g => serviceAnswerState(g.key)).length;
+  // The counter's parent is the .setup-substep row that also holds the track;
+  // hiding the row rather than the two children keeps them from leaving a gap.
+  count.parentElement.hidden = groups.length < 2;
+  count.textContent = `${answered} of ${groups.length} answered`;
+  fill.style.width = groups.length ? `${(answered / groups.length) * 100}%` : '0%';
+}
+
+// A row of chips for one bucket. `repaint` is the card's own; every chip in
+// the card is repainted from the answers object on every click rather than
+// toggling the one that was pressed, because 'none' changes the others.
+function buildAnswerChipRow(group, bucket, chips, legend, repaint) {
+  const row = document.createElement('div');
+  row.className = 'answer-chips';
+  row.setAttribute('role', 'group');
+  row.setAttribute('aria-label', legend);
+  const buttons = [];
+  for (const chip of chips) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = chip.id === NEED_NONE_ID ? 'pill answer-chip answer-chip-none' : 'pill answer-chip';
+    btn.dataset.bucket = bucket;
+    btn.dataset.chip = chip.id;
+    btn.textContent = chip.label;
+    btn.addEventListener('click', () => {
+      toggleServiceChip(group.key, bucket, chip.id);
+      repaint();
       saveSetupDraft();
     });
+    buttons.push(btn);
+    row.appendChild(btn);
+  }
+  const sync = () => {
+    const picked = serviceAnswersFor(group.key)[bucket];
+    for (const btn of buttons) {
+      const on = picked.includes(btn.dataset.chip);
+      btn.classList.toggle('selected', on);
+      btn.setAttribute('aria-pressed', String(on));
+    }
+  };
+  return { row, sync };
+}
+
+// The optional refinement under a chip row. Hidden behind a reveal because the
+// chips are the answer and this is the exception — showing an empty textarea
+// on every card would put the wall of text straight back.
+function buildServiceNote(group, field, label, placeholder, repaint) {
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'setup-service-note-toggle';
+  toggle.textContent = '+ Something else';
+
+  const area = document.createElement('textarea');
+  area.className = 'setup-service-note';
+  area.rows = 2;
+  area.setAttribute('aria-label', label);
+  area.placeholder = placeholder;
+  area.value = serviceAnswersFor(group.key)[field] || '';
+
+  // Revealed on its own where a migrated draft already holds typed text, so
+  // nothing written by the old wizard is hidden behind a button the user has
+  // no reason to press.
+  let revealed = !!area.value;
+
+  // Two listeners, because the two halves of "saving this" have very different
+  // costs and only one of them can afford to wait.
+  //
+  // 'input' banks the text in the answers object on every keystroke, and it has
+  // to be every keystroke: a chip tap repaints the card, and the repaint syncs
+  // this textarea back from the answers object — so anything not yet in there
+  // is precisely what a repaint writes over. On a desktop that never showed,
+  // because clicking a <button> blurs the textarea and 'change' fires first. On
+  // a phone it is the ordinary case: iOS Safari and the Android WebView do not
+  // reliably move focus onto a button when it is tapped, so no 'change' ever
+  // arrived, the stored answer was still '', and a half-typed sentence — the
+  // most valuable thing anybody types into this wizard — was replaced with an
+  // empty string, with no undo, and then committed by the draft save behind it.
+  //
+  // What 'change' was originally chosen to avoid was the *storage* write, not
+  // the bookkeeping: this field invites a sentence, and one chrome.storage
+  // write per letter is far more than it is worth. That reasoning still holds,
+  // so only the storage side is deferred — saveSetupDraftSoon coalesces a burst
+  // of typing into a single draft write shortly after the burst stops.
+  area.addEventListener('input', () => {
+    serviceAnswersFor(group.key)[field] = area.value.trim();
+    saveSetupDraftSoon();
+  });
+
+  // 'change' — a blur, or anything else that takes focus away — stays the
+  // moment the card repaints. The preview line is aria-live, so repainting per
+  // keystroke would make a screen reader re-read the whole sentence on every
+  // letter; the counter and the "Answered" mark can wait for the same moment
+  // without anything being lost, since the text itself is already banked above.
+  // The save here is the immediate one, which also settles whatever the
+  // debounce was still holding.
+  area.addEventListener('change', () => {
+    serviceAnswersFor(group.key)[field] = area.value.trim();
+    repaint();
+    saveSetupDraft();
+  });
+  toggle.addEventListener('click', () => {
+    revealed = !revealed;
+    repaint();
+    if (revealed) area.focus();
+  });
+
+  // `available` is false for the needs note once "nothing" is picked: there is
+  // no fair reason left to refine.
+  //
+  // The assignment below overwrites whatever is in the box, and there is now
+  // exactly one case where it does: picking "nothing" clears needsNote on
+  // purpose (see toggleServiceChip), and the box has to show that clearance.
+  // It can no longer overwrite unsaved typing, because 'input' above keeps
+  // `stored` level with what has been typed — including while the field still
+  // has focus. The comparison is trimmed on both sides, so a trailing space
+  // mid-sentence is not counted as a difference and the caret is left alone.
+  const sync = (available) => {
+    const stored = serviceAnswersFor(group.key)[field] || '';
+    if (area.value.trim() !== stored) area.value = stored;
+    toggle.hidden = !available;
+    toggle.setAttribute('aria-expanded', String(available && (revealed || !!stored)));
+    area.hidden = !(available && (revealed || !!stored));
+  };
+  return { toggle, area, sync };
+}
+
+function buildMicroLabel(text) {
+  const p = document.createElement('p');
+  p.className = 'micro-label';
+  p.textContent = text;
+  return p;
+}
+
+// One service's card. Built entirely here rather than cloned from markup
+// because the labels come from the catalogue and, for an Android app outside
+// it, from whatever the native bridge called the package — third-party text,
+// so textContent throughout and never innerHTML.
+function buildServiceAnswerCard(group, index, groups) {
+  const catalogue = serviceAnswerCatalogue(group.key);
+  const bodyId = `setup-service-body-${index + 1}`;
+  const next = groups[index + 1] || null;
+
+  const li = document.createElement('li');
+  li.className = 'setup-service';
+  li.dataset.service = group.key;
+
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'setup-service-head';
+  head.setAttribute('aria-controls', bodyId);
+
+  const mark = document.createElement('span');
+  mark.className = 'setup-service-mark';
+  mark.setAttribute('aria-hidden', 'true');
+  applyServiceMark(mark, group);
+
+  const name = document.createElement('span');
+  name.className = 'setup-service-name';
+  name.textContent = group.label;
+
+  const state = document.createElement('span');
+  state.className = 'setup-service-state micro-label';
+
+  const chev = document.createElement('span');
+  chev.className = 'setup-service-chev';
+  chev.setAttribute('aria-hidden', 'true');
+
+  head.append(mark, name, state, chev);
+  head.addEventListener('click', () => {
+    expandService(head.getAttribute('aria-expanded') === 'true' ? null : group.key);
+  });
+
+  const body = document.createElement('div');
+  body.className = 'setup-service-body';
+  body.id = bodyId;
+
+  // Only where it explains something: that two things the user picked
+  // separately are asking their questions once.
+  if ((group.domains.length + group.apps.length) > 1) {
+    const members = buildMicroLabel(serviceMembersLabel(group, setupAppLabels));
+    members.classList.add('setup-service-members');
+    body.appendChild(members);
+  }
+
+  const preview = document.createElement('p');
+  preview.className = 'setup-service-preview';
+  preview.setAttribute('aria-live', 'polite');
+
+  const repaint = () => {
+    const status = serviceAnswerState(group.key);
+    state.textContent = status === 'none' ? 'Blocked outright' : status === 'answered' ? 'Answered' : '';
+    state.classList.toggle('answered', status === 'answered');
+    needs.sync();
+    costs.sync();
+    needsNote.sync(!serviceAnswersFor(group.key).needs.includes(NEED_NONE_ID));
+    costsNote.sync(true);
+    preview.textContent = previewLineFor(group);
+    refreshPurposeProgress();
+  };
+
+  const needs = buildAnswerChipRow(group, 'needs', catalogue.needs, `Fair reasons to open ${group.label}`, repaint);
+  const needsNote = buildServiceNote(group, 'needsNote',
+    `Anything else that counts as a fair reason for ${group.label}`,
+    "e.g. Only my sister's messages, never the feed.", repaint);
+  const costs = buildAnswerChipRow(group, 'costs', catalogue.costs, `Why ${group.label} is blocked`, repaint);
+  const costsNote = buildServiceNote(group, 'costsNote',
+    `Anything else about why ${group.label} is on the list`,
+    'e.g. It eats the evening and I never meant to open it.', repaint);
+
+  body.append(
+    buildMicroLabel('When is opening it fair enough?'), needs.row, needsNote.toggle, needsNote.area,
+    buildMicroLabel('And why is it on the list?'), costs.row, costsNote.toggle, costsNote.area,
+    preview
+  );
+
+  // The footer button is the only thing that moves the stack on, so on the
+  // last card it must not pretend there is more to come.
+  const advance = document.createElement('button');
+  advance.type = 'button';
+  advance.className = 'secondary setup-service-next';
+  advance.textContent = next ? `Next: ${next.label}` : "Done — that's all of them";
+  advance.addEventListener('click', () => {
+    expandService(next ? next.key : null);
+    if (next) {
+      li.parentElement.querySelector(`[data-service="${CSS.escape(next.key)}"]`)
+        ?.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    }
+  });
+  body.appendChild(advance);
+
+  li.append(head, body);
+
+  const open = group.key === setupExpandedService;
+  head.setAttribute('aria-expanded', String(open));
+  body.hidden = !open;
+  repaint();
+  return li;
+}
+
+// Honoured by collapsing the motion rather than removing it, the same way
+// options.css's own reduced-motion block does.
+function prefersReducedMotion() {
+  try {
+    return !!window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch (e) {
+    return false;
   }
 }
 
-function renderPurposeStep(key) {
-  currentPurposeGroup = key;
-  const group = currentServiceGroups().find(g => g.key === key);
-  // The order is recomputed on every selection change, so a step can only
-  // point at a service that still exists. Guarding anyway: a stale draft
-  // resolving to a removed service must not blank the screen.
-  if (!group) return;
-
-  document.getElementById('setup-purpose-title').textContent = group.label;
-
-  // Two things at once, and both earn their place. "3 of 6" makes the run
-  // finite: "Step 7 of 14" says where you are in the wizard but not how much
-  // of *this* is left, and a repeating screen with no end in sight is what
-  // makes a thorough setup read as an interrogation. The members clause only
-  // appears when it explains something — that two things the user picked
-  // separately are asking their questions once.
-  const purposeSteps = setupStepOrder.filter(s => s.group);
-  const position = purposeSteps.findIndex(s => s.group === key) + 1;
-  const parts = [];
-  if (purposeSteps.length > 1) parts.push(`${position} of ${purposeSteps.length}`);
-  if ((group.domains.length + group.apps.length) > 1) {
-    parts.push(serviceMembersLabel(group, setupAppLabels));
-  }
-  const members = document.getElementById('setup-purpose-members');
-  members.textContent = parts.join(' · ');
-  members.hidden = !parts.length;
-
-  const mark = document.getElementById('setup-purpose-mark');
-  applyServiceMark(mark, group);
+// Rebuilds the whole stack. Cheap (a handful of cards), and the only way to be
+// certain a service removed on the step before has no card left over.
+function renderPurposeStack() {
+  const stack = document.getElementById('setup-purpose-stack');
+  const empty = document.getElementById('setup-purpose-empty');
+  const groups = currentServiceGroups();
 
   document.getElementById('setup-purpose-subtitle').textContent = setupBlockingMode === 'simple'
-    ? 'Both optional. Simple mode has no coach to read these, but they are kept — turn a coach on later and it starts here.'
-    : 'Both optional. Your coach reads these at the gate, so it can tell a real errand from a scroll dressed up as one.';
+    ? 'Tap what counts as a fair reason. Simple mode has no coach to read these — they are kept, and a coach turned on later starts from them.'
+    : 'Tap what counts as a fair reason. Your coach reads these at every block, so it can tell a real errand from a scroll dressed up as one.';
 
-  document.getElementById('setup-purpose-why-label').textContent =
-    `Why do you need to use ${group.label} with Intention?`;
-  document.getElementById('setup-purpose-legit-label').textContent =
-    `When do you consider yourself to have legitimate reason to use ${group.label}?`;
+  stack.innerHTML = '';
+  stack.hidden = groups.length === 0;
+  empty.hidden = groups.length > 0;
 
-  const answers = purposeAnswersFor(key);
-  document.getElementById('setup-purpose-why-input').value = answers.purpose || '';
-  document.getElementById('setup-purpose-legit-input').value = answers.legitimateUse || '';
+  if (!groups.length) {
+    // An iOS user who blocked apps and no websites lands here legitimately:
+    // Apple's picker never tells the web layer which apps were chosen, so
+    // there is nothing to name a card after. Say that, rather than showing an
+    // empty screen that reads as a bug.
+    empty.textContent = setupIOSSelectionCount > 0
+      ? "Nothing to ask about here. Apple's app picker never tells Intention which apps you chose, so it can't ask about them by name — your coach will ask at the block instead. Add a website and it will show up here."
+      : 'Nothing picked yet. Go back a step and add a site or an app, and it will show up here to answer for.';
+    refreshPurposeProgress();
+    return;
+  }
+
+  // Which card opens: the one that was open, if it is still on the list; else
+  // the first one with nothing on it, so arriving here always lands on work
+  // still to do; else the first.
+  if (!groups.some(g => g.key === setupExpandedService)) {
+    setupExpandedService = (groups.find(g => !serviceAnswerState(g.key)) || groups[0]).key;
+  }
+
+  groups.forEach((group, i) => stack.appendChild(buildServiceAnswerCard(group, i, groups)));
+  refreshPurposeProgress();
+}
+
+// Called by the site and app list renderers after an add or a remove — and it
+// currently never does anything, because the condition it is guarding on
+// cannot hold.
+//
+// The case it was written for is Back-then-remove: the stack is already built
+// and one of its cards has just stopped existing. But removing a site or an
+// app is only possible from the rows on the sites and apps steps, and showStep
+// hides every section except the one it is showing — so by the time either
+// list renderer runs, #setup-step-purpose is hidden, every time. The other two
+// call paths (showSetupView's first render, and restoreSetupDraft's) run
+// before the first showStep, when every section still carries the `hidden`
+// attribute it ships with in the markup. Instrumenting a real wizard through
+// exactly the Back-then-remove sequence gives three calls and three hidden
+// steps.
+//
+// Nothing is missed by that: showStep rebuilds the whole stack on arrival at
+// the purpose step, which is what actually covers a card whose service is
+// gone. This is left in place only because deleting it means deleting its two
+// call sites in options-lists.js as well, and `no-undef` is what would catch
+// half of that being done.
+function refreshPurposeStackIfVisible() {
+  const step = document.getElementById('setup-step-purpose');
+  if (step && !step.hidden) renderPurposeStack();
 }
 
 // The brand glyph from the suggestion chips, reused so the service is
@@ -548,13 +982,12 @@ function renderWelcomeStep() {
   const blocksApps = HAS_APP_BLOCKING || HAS_IOS_APP_BLOCKING;
   items.push([blocksApps ? 'Choose your sites and apps' : 'Choose your sites',
     'The ones you want a moment of friction in front of.']);
-  items.push(['Say what you’re trying to focus on',
-    'Two short answers, so a block can point at your own reasons instead of just saying no.']);
-  // Announced here rather than discovered at step 6 of 14. The run is as long
-  // as the list they are about to pick, and saying so up front is what makes
-  // it read as thorough instead of endless.
-  items.push([blocksApps ? 'Then the same, for each one' : 'Then the same, for each site',
-    'Why you need it, and when using it is fair enough. Skippable, and worth more than anything else you tell your coach.']);
+  // Announced here rather than discovered later. One screen, however long the
+  // list is — which is worth saying out loud, because the version of this that
+  // gave each service its own screen is exactly what made a thorough setup
+  // read as endless.
+  items.push(['One screen for what each one is for',
+    "A few taps per site: when opening it is fair enough, and why it's on the list. Skippable, and worth more to your coach than anything else you tell it."]);
   items.push(['Pick how a block should work',
     'A coach you have to talk past, or a plain block with no AI involved.']);
 
@@ -585,7 +1018,7 @@ function wireSafariStep() {
   // switch — so the host fires this event instead, from
   // ViewController.appDidBecomeActive.
   window.addEventListener('intention-app-active', () => {
-    if (setupStepOrder[setupStep - 1]?.id === 'setup-step-safari') refreshSafariStatus();
+    if (setupStepOrder[setupStep - 1] === 'setup-step-safari') refreshSafariStatus();
   });
   refreshSafariStatus();
 }
@@ -633,10 +1066,12 @@ async function refreshSafariStatus() {
 function collectServiceReasons() {
   const live = new Set(currentServiceGroups().map(g => g.key));
   const out = {};
-  for (const [key, value] of Object.entries(setupServiceReasons)) {
+  for (const [key, answers] of Object.entries(setupServiceAnswers)) {
     if (!live.has(key)) continue;
-    const purpose = (value?.purpose || '').trim();
-    const legitimateUse = (value?.legitimateUse || '').trim();
+    // The chips become prose here and nowhere else. This is the one seam
+    // between the wizard's input and the storage shape every other reader has
+    // always been given, which is why changing the input cost no migration.
+    const { purpose, legitimateUse } = composeServiceReason(key, answers);
     if (!purpose && !legitimateUse) continue;
     out[key] = { purpose, legitimateUse, updatedAt: Date.now() };
   }

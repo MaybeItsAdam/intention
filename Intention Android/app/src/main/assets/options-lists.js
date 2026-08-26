@@ -244,6 +244,11 @@ function wireAppSearch(inputId, resultsId, isSelected, onAdd) {
 function renderSetupDomains() {
   renderSiteRecommendations('setup-sites-recommend-grid', 'setup-sites-recommend-more', setupBlockedDomains);
   refreshSetupNav();
+  // The per-service step is one screen that iterates whatever is on the list,
+  // and it rebuilds itself on arrival - which covers everything except going
+  // BACK to this step and removing something, where the stack is already built
+  // and one of its cards has just stopped existing.
+  refreshPurposeStackIfVisible();
   saveSetupDraft();
   const list = document.getElementById('setup-websites-list');
   list.innerHTML = '';
@@ -305,6 +310,9 @@ function addSetupApp(app) {
 function renderSetupApps() {
   renderAppRecommendations('setup-apps-recommend-grid', 'setup-apps-recommend-more', setupBlockedApps);
   refreshSetupNav();
+  // Same reason as renderSetupDomains: an app removed on a Back leaves a card
+  // behind unless the stack is told.
+  refreshPurposeStackIfVisible();
   saveSetupDraft();
   const list = document.getElementById('setup-apps-list');
   list.innerHTML = '';

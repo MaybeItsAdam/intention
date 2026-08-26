@@ -99,28 +99,35 @@
            could do nothing with. What the coach knows about you in general is
            now built through conversation instead (the update_context tool). -->
 
-      <!-- One section, repainted once per service. Generating a section per
-           selection would break the wizard guard in tests/options-wizard.test.js,
-           which resolves every setup-step-* literal in options.js against a real
-           id in this file. -->
+      <!-- ONE screen for every service, iterated inline by renderPurposeStack().
+           This used to be one WIZARD STEP per service, which made the wizard's
+           own length a function of the blocklist: six picks meant six
+           near-identical screens of two textareas each, and the "Step N of M"
+           denominator moved every time a site was added on the step before.
+           One step means that denominator is now a per-platform constant
+           (browser 6, Android 7, iOS 8) and cannot move at all — strictly
+           stronger than the guarantee the comment above the sites step asks
+           for.
+
+           The stack has its own internal counter ("2 of 6 answered") rather
+           than borrowing the wizard's. They measure different things: the
+           wizard bar says where you are in setup, and this says how much of
+           THIS is left, which is the part that reads as endless when it is not
+           shown.
+
+           Rebuilt on arrival, which is safe because the selection can only be
+           edited on the steps before this one — and renderSetupDomains /
+           renderSetupApps repaint it directly for the Back-then-remove path. -->
       <section class="card setup-step" id="setup-step-purpose" hidden>
-        <div class="setup-purpose-head">
-          <span class="setup-purpose-mark" id="setup-purpose-mark"></span>
-          <div>
-            <h3 id="setup-purpose-title">This service</h3>
-            <p class="micro-label" id="setup-purpose-members"></p>
-          </div>
-        </div>
+        <h3>What is each one for?</h3>
         <p class="subtitle" id="setup-purpose-subtitle"></p>
-        <label for="setup-purpose-why-input" id="setup-purpose-why-label">Why do you need to use this with Intention?</label>
-        <div class="input-group">
-          <textarea id="setup-purpose-why-input" rows="3" placeholder="e.g. Replying to DMs from my sister, who lives abroad."></textarea>
+        <div class="setup-substep">
+          <div class="setup-substep-track"><div id="setup-purpose-fill" class="setup-substep-fill"></div></div>
+          <span id="setup-purpose-count" class="micro-label"></span>
         </div>
-        <label for="setup-purpose-legit-input" id="setup-purpose-legit-label">When do you consider yourself to have legitimate reason to use it?</label>
-        <div class="input-group">
-          <textarea id="setup-purpose-legit-input" rows="3" placeholder="e.g. A specific reply, or an event I've been invited to. Never the feed."></textarea>
-        </div>
-        <button type="button" id="setup-purpose-skip-btn" class="secondary setup-purpose-skip">Skip these questions</button>
+        <p class="setup-check" id="setup-purpose-empty" hidden></p>
+        <ul class="setup-service-stack" id="setup-purpose-stack"></ul>
+        <button type="button" id="setup-purpose-skip-btn" class="secondary setup-purpose-skip">Skip these — my coach can ask me later</button>
       </section>
 
       <section class="card setup-step" id="setup-step-access" hidden>

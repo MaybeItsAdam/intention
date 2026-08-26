@@ -114,10 +114,11 @@ describe('which entries are accepted onto the blocklist', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The step order stopped being a fixed list of section ids the moment the
-// wizard grew a screen per selected service. These are the seams that broke
-// when it did: an id that now repeats, a length that depends on the
-// blocklist, and a draft that used to store a bare index.
+// The step order. It briefly stopped being a fixed list of section ids — the
+// wizard grew one screen per selected service, so an id repeated, the length
+// depended on the blocklist, and a step had to be stored as an id plus a
+// service key. It is a flat list again, and these are the assertions that say
+// so: the total is now a property of the BUILD and of nothing the user does.
 // ---------------------------------------------------------------------------
 
 // HAS_APP_BLOCKING and friends are consts captured at load, so the platform is
@@ -130,39 +131,49 @@ const orderFor = (state) => vm.runInContext(`
 `, ctx);
 
 describe('computeStepOrder', () => {
-  // The general "what are you protecting" step used to sit between the sites
-  // step and these, asking in the abstract what each of these asks concretely.
-  it('adds one purpose step per service, straight after the sites step', () => {
-    const order = JSON.parse(orderFor({ domains: ['reddit.com', 'x.com'] }));
-    expect(order.map(s => s.id)).toEqual([
-      'setup-step-welcome',
-      'setup-step-sites',
-      'setup-step-purpose',
-      'setup-step-purpose',
-      'setup-step-mode',
-      'setup-step-access',
-      'setup-step-done'
-    ]);
-    expect(order.filter(s => s.group).map(s => s.group)).toEqual(['reddit.com', 'x.com']);
+  const BROWSER_ORDER = [
+    'setup-step-welcome',
+    'setup-step-sites',
+    'setup-step-purpose',
+    'setup-step-mode',
+    'setup-step-access',
+    'setup-step-done'
+  ];
+
+  it('is a flat list with the purpose step directly after the sites step', () => {
+    expect(JSON.parse(orderFor({ domains: ['reddit.com', 'x.com'] }))).toEqual(BROWSER_ORDER);
   });
 
-  it('asks once for a site and its app, not twice', () => {
-    const order = JSON.parse(orderFor({
+  // The whole point of the change. Six services used to mean six extra steps,
+  // and the denominator of "Step 2 of N" moved every time a site was added on
+  // the step before — under the user's finger, since that is the step the
+  // adding happens on.
+  it('does not grow with the blocklist', () => {
+    const none = orderFor({});
+    const one = orderFor({ domains: ['reddit.com'] });
+    const six = orderFor({
+      domains: ['reddit.com', 'x.com', 'youtube.com', 'tiktok.com', 'instagram.com', 'some-blog.example']
+    });
+    expect(none).toEqual(one);
+    expect(one).toEqual(six);
+  });
+
+  it('never repeats an id, so an id identifies a step again', () => {
+    const order = JSON.parse(orderFor({ domains: ['reddit.com', 'x.com', 'instagram.com'] }));
+    expect(new Set(order).size).toBe(order.length);
+  });
+
+  it('asks once for a site and its app, and does not add a step for either', () => {
+    expect(JSON.parse(orderFor({
       domains: ['instagram.com'],
       apps: ['com.instagram.android'],
       appLabels: { 'com.instagram.android': 'Instagram' }
-    }));
-    expect(order.filter(s => s.group).map(s => s.group)).toEqual(['instagram.com']);
-  });
-
-  it('has no purpose steps at all for an empty blocklist', () => {
-    const order = JSON.parse(orderFor({}));
-    expect(order.some(s => s.group)).toBe(false);
+    }))).toEqual(BROWSER_ORDER);
   });
 
   // The wizard's own guard is that the access step is unconditionally in the
   // order, so toggling Coach/Simple can't move the denominator. The purpose
-  // steps have to hold the same line.
+  // step has to hold the same line.
   it('keeps the questions in simple mode, where nothing will read them', () => {
     const coach = JSON.parse(vm.runInContext(`
       setupBlockedDomains = ['reddit.com']; setupBlockedApps = [];
@@ -176,31 +187,48 @@ describe('computeStepOrder', () => {
 
   it('every id it can emit is one the wizard test already checks exists', () => {
     const order = JSON.parse(orderFor({ domains: ['reddit.com'] }));
-    for (const step of order) expect(step.id).toMatch(/^setup-step-[a-z-]+$/);
+    for (const id of order) expect(id).toMatch(/^setup-step-[a-z-]+$/);
   });
 });
 
+// The wizard holds chip ids; storage holds the prose it has always held. This
+// is the seam between the two, and the reason changing the input cost no
+// migration anywhere downstream.
 describe('collectServiceReasons', () => {
   const collect = (state) => vm.runInContext(`
     setupBlockedDomains = ${JSON.stringify(state.domains || [])};
     setupBlockedApps = ${JSON.stringify(state.apps || [])};
     setupAppLabels = {};
-    setupServiceReasons = ${JSON.stringify(state.reasons || {})};
+    setupServiceAnswers = ${JSON.stringify(state.answers || {})};
     JSON.stringify(collectServiceReasons());
   `, ctx);
 
-  it('keeps what was written', () => {
+  it('composes the chips into the pair every reader downstream expects', () => {
     const out = JSON.parse(collect({
-      domains: ['reddit.com'],
-      reasons: { 'reddit.com': { purpose: 'Two niche subs.', legitimateUse: '' } }
+      domains: ['instagram.com'],
+      answers: {
+        'instagram.com': { needs: ['dm', 'sent'], costs: ['hours', 'auto'], needsNote: 'Only my sister.', costsNote: '' }
+      }
     }));
-    expect(out['reddit.com'].purpose).toBe('Two niche subs.');
+    expect(out['instagram.com'].purpose)
+      .toBe('It eats hours I meant to spend elsewhere; I open it without ever deciding to.');
+    expect(out['instagram.com'].legitimateUse)
+      .toBe('Replying to a specific DM; opening a link someone actually sent me. Only my sister.');
+    expect(typeof out['instagram.com'].updatedAt).toBe('number');
   });
 
-  it('drops an answer left blank — no answer and a blank answer are the same', () => {
+  it('keeps a free-text refinement typed with no chips tapped', () => {
     const out = JSON.parse(collect({
       domains: ['reddit.com'],
-      reasons: { 'reddit.com': { purpose: '   ', legitimateUse: '' } }
+      answers: { 'reddit.com': { needs: [], costs: [], needsNote: 'Two niche subs.', costsNote: '' } }
+    }));
+    expect(out['reddit.com'].legitimateUse).toBe('Two niche subs.');
+  });
+
+  it('drops a service nothing was tapped or typed for', () => {
+    const out = JSON.parse(collect({
+      domains: ['reddit.com'],
+      answers: { 'reddit.com': { needs: [], costs: [], needsNote: '   ', costsNote: '' } }
     }));
     expect(out).toEqual({});
   });
@@ -210,7 +238,7 @@ describe('collectServiceReasons', () => {
   it('drops an answer for a service since removed from the list', () => {
     const out = JSON.parse(collect({
       domains: ['x.com'],
-      reasons: { 'reddit.com': { purpose: 'Two niche subs.' } }
+      answers: { 'reddit.com': { needs: ['thread'], costs: [] } }
     }));
     expect(out).toEqual({});
   });
@@ -219,9 +247,20 @@ describe('collectServiceReasons', () => {
     const out = JSON.parse(collect({
       domains: [],
       apps: ['com.instagram.android'],
-      reasons: { 'instagram.com': { purpose: 'DMs only.' } }
+      answers: { 'instagram.com': { needs: ['dm'], costs: [] } }
     }));
     expect(Object.keys(out)).toEqual(['instagram.com']);
+  });
+
+  // The strongest thing this step can be told, and the one answer that is NOT
+  // the absence of chips — so it has to reach storage as a sentence rather
+  // than being dropped as empty.
+  it("turns 'nothing — I just want it gone' into a sentence of its own", () => {
+    const out = JSON.parse(collect({
+      domains: ['instagram.com'],
+      answers: { 'instagram.com': { needs: ['none'], costs: [] } }
+    }));
+    expect(out['instagram.com'].legitimateUse).toBe("Nothing — I don't actually need it.");
   });
 });
 

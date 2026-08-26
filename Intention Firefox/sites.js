@@ -167,3 +167,296 @@ function serviceMembersLabel(group, appLabels) {
   if (parts.length <= 1) return parts[0] || '';
   return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
 }
+
+// ---------------------------------------------------------------------------
+// The answer catalogue — what the wizard asks about each service, as taps.
+// ---------------------------------------------------------------------------
+//
+// Setup used to ask two open textareas per blocked service. They are the most
+// valuable thing the coach is ever given — a rule the user wrote while calm,
+// which renderSiteReasonBlock hands it at every gate — and they were also the
+// most skipped, because typing two paragraphs about six services on a phone is
+// an interrogation. Taps are the fix: a chip is a structured answer, it costs
+// one thumb, and it can be turned into better prose than most people type.
+//
+// Three strings per chip, and the third is what makes the consequence preview
+// possible at all:
+//
+//   label  the button text. Kept to 34 characters or fewer — past that a chip
+//          wraps to two lines at 320px, which is what a phone actually is.
+//   coach  a FIRST-PERSON fragment, no leading capital (except the pronoun
+//          "I") and no trailing punctuation, because composeServiceReason
+//          joins several of them with "; " and capitalises only the first.
+//   you    a SECOND-PERSON noun phrase, used only by the wizard's preview line
+//          ("Your coach will hear you out for a DM reply"). It exists because
+//          the same idea has to be said back to the user in their own person,
+//          and deriving one from the other reads like a machine talking.
+//
+// Nothing here reaches storage as an id. collectServiceReasons() composes the
+// chips into the same { purpose, legitimateUse } prose the two textareas
+// produced, so sanitizeServiceReasons, renderSiteReasonBlock, the settings row
+// and every native reader are untouched by this. The ids live only in the
+// wizard's own draft.
+
+// Needs chips shared by several services. A service may override any of them
+// with its own wording — Instagram says "Replying to DMs", not "Replying to a
+// message" — by spelling the chip out in its own list under the same id.
+const SERVICE_NEED = {
+  dm: { id: 'dm', label: 'Replying to a message', coach: 'replying to a specific message', you: 'a message reply' },
+  sent: { id: 'sent', label: 'Something someone sent me', coach: 'opening a link someone actually sent me', you: 'a link someone sent you' },
+  post: { id: 'post', label: 'Posting something of my own', coach: 'posting something of my own', you: 'posting your own' },
+  lookup: { id: 'lookup', label: 'Looking one person or thing up', coach: 'looking up one specific person or account', you: 'one lookup' },
+  work: { id: 'work', label: "It's part of my job", coach: "work I'm actually paid to do there", you: 'work you are paid for' }
+};
+
+// The last chip on every needs list, appended by serviceAnswerCatalogue rather
+// than written into any of them — one "nothing" option, always, in the same
+// place. It is exclusive in both directions (see toggleServiceChip): it is the
+// strongest thing the wizard can be told, and it means nothing if it can sit
+// alongside four reasons the site is fine.
+const NEED_NONE_ID = 'none';
+const SERVICE_NEED_NONE = { id: NEED_NONE_ID, label: 'Nothing — I just want it gone', coach: '', you: '' };
+// Composed instead of joined, because there are no fragments to join.
+const NEED_NONE_PROSE = "Nothing — I don't actually need it.";
+
+// Cost chips — "and why is it on the list?". One default set and two
+// overrides, because "it eats hours" is the wrong complaint about Netflix and
+// the wrong complaint about LinkedIn for opposite reasons.
+const SERVICE_COST = {
+  hours: { id: 'hours', label: 'It eats hours', coach: 'it eats hours I meant to spend elsewhere' },
+  auto: { id: 'auto', label: 'I open it without deciding to', coach: 'I open it without ever deciding to' },
+  worse: { id: 'worse', label: 'It leaves me feeling worse', coach: 'it leaves me feeling worse than before I opened it' },
+  derail: { id: 'derail', label: 'It derails my work', coach: 'it pulls me off work I care about' },
+  night: { id: 'night', label: 'It keeps me up', coach: "I'm still on it last thing at night" },
+  onemore: { id: 'onemore', label: 'One becomes four', coach: 'one becomes four before I notice' },
+  anxious: { id: 'anxious', label: 'It makes me anxious', coach: 'it makes me anxious about where I am in my career' }
+};
+
+const SERVICE_COSTS_DEFAULT = [SERVICE_COST.hours, SERVICE_COST.auto, SERVICE_COST.worse, SERVICE_COST.derail, SERVICE_COST.night];
+// Episodes and autoplay, not an infinite feed: "one becomes four" is the
+// complaint people actually have about a video service.
+const SERVICE_COSTS_VIDEO = [SERVICE_COST.onemore, SERVICE_COST.auto, SERVICE_COST.derail, SERVICE_COST.night];
+
+// Netflix, Prime Video and Disney+ are the same product with different
+// libraries, so they ask the same thing rather than three near-copies.
+const SERVICE_ANSWERS_WATCHLIST = {
+  feed: 'browsing for something to watch',
+  costs: SERVICE_COSTS_VIDEO,
+  needs: [
+    { id: 'planned', label: 'One thing I already chose', coach: 'one thing I had already chosen to watch', you: 'something you already chose' },
+    { id: 'together', label: 'Watching with someone else', coach: 'watching with someone else', you: 'watching with someone' }
+  ]
+};
+
+// Keyed by the same service key SITE_META uses, so serviceKeyFor() already
+// resolves an Android package onto the right entry and one card asks for a
+// site and its app at once.
+//
+// `feed` is the noun phrase the preview line pushes back on — the thing the
+// user is NOT here for. It is per-service because "the feed" is meaningless
+// for YouTube and wrong for Netflix.
+//
+// `costs` omitted means SERVICE_COSTS_DEFAULT. Every COMMON_SITES entry and
+// every APP_ICON_SITE value must appear here; tests/service-answers.test.js
+// fails if one is added to either list and forgotten here.
+const SERVICE_ANSWERS = {
+  'instagram.com': {
+    feed: 'the feed, Reels and Explore',
+    needs: [
+      { id: 'dm', label: 'Replying to DMs', coach: 'replying to a specific DM', you: 'a DM reply' },
+      SERVICE_NEED.sent,
+      SERVICE_NEED.post,
+      SERVICE_NEED.lookup
+    ]
+  },
+  'x.com': {
+    feed: 'the timeline',
+    needs: [
+      SERVICE_NEED.dm,
+      { id: 'sent', label: 'A post someone sent me', coach: 'a post someone actually sent me', you: 'a post someone sent you' },
+      SERVICE_NEED.post,
+      { id: 'live', label: 'Following one live event', coach: 'following one live event as it happens', you: 'one live event' }
+    ]
+  },
+  'youtube.com': {
+    feed: 'the homepage and Shorts',
+    costs: SERVICE_COSTS_VIDEO,
+    needs: [
+      { id: 'chosen', label: 'One video I already picked', coach: "one video I'd already decided to watch", you: 'a video you already picked' },
+      { id: 'howto', label: 'Learning or fixing something', coach: 'a tutorial for something specific I am learning or fixing', you: 'a tutorial' },
+      { id: 'music', label: 'Music while I work', coach: 'music in the background while I work', you: 'background music' },
+      { id: 'own', label: 'My own channel', coach: 'my own channel and uploads', you: 'your own channel' }
+    ]
+  },
+  'tiktok.com': {
+    feed: 'the For You feed',
+    needs: [
+      { id: 'sent', label: 'A video someone sent me', coach: 'a video someone actually sent me', you: 'a video someone sent you' },
+      { id: 'creator', label: 'One creator I follow', coach: 'one creator I actually follow', you: 'one creator' },
+      SERVICE_NEED.post
+    ]
+  },
+  'reddit.com': {
+    feed: 'the front page',
+    needs: [
+      { id: 'thread', label: 'One thread someone sent me', coach: 'one thread someone actually sent me', you: 'one thread' },
+      { id: 'research', label: "A question I'm researching", coach: 'a specific question I am researching', you: 'one question' },
+      { id: 'community', label: 'A community I post in', coach: 'a community I actually take part in', you: 'a community you post in' }
+    ]
+  },
+  'facebook.com': {
+    feed: 'the feed',
+    needs: [
+      SERVICE_NEED.dm,
+      { id: 'event', label: "An event or group I'm in", coach: 'an event or a group I actually take part in', you: 'an event or group' },
+      { id: 'market', label: 'Marketplace — something specific', coach: 'looking on Marketplace for something specific I am buying or selling', you: 'one Marketplace listing' },
+      SERVICE_NEED.lookup
+    ]
+  },
+  'threads.com': {
+    feed: 'the feed',
+    needs: [
+      { id: 'reply', label: 'Replying to someone', coach: 'replying to someone directly', you: 'a reply' },
+      SERVICE_NEED.sent,
+      SERVICE_NEED.post
+    ]
+  },
+  'twitch.tv': {
+    feed: 'browsing the directory',
+    costs: SERVICE_COSTS_VIDEO,
+    needs: [
+      { id: 'planned', label: 'One stream I planned to watch', coach: 'one stream I had planned to watch', you: 'a stream you planned' },
+      { id: 'live', label: 'Someone I follow going live', coach: 'someone I follow going live', you: 'someone you follow going live' }
+    ]
+  },
+  'netflix.com': SERVICE_ANSWERS_WATCHLIST,
+  'primevideo.com': SERVICE_ANSWERS_WATCHLIST,
+  'disneyplus.com': SERVICE_ANSWERS_WATCHLIST,
+  'linkedin.com': {
+    feed: 'the feed',
+    // Not hours — the complaint about LinkedIn is what it does to you while
+    // you are on it, and naming that is what makes the answer worth reading.
+    costs: [SERVICE_COST.anxious, SERVICE_COST.hours, SERVICE_COST.auto, SERVICE_COST.derail],
+    needs: [
+      SERVICE_NEED.dm,
+      { id: 'apply', label: "A job I'm actually applying for", coach: 'a job I am actually applying for', you: 'one job application' },
+      SERVICE_NEED.post,
+      SERVICE_NEED.lookup
+    ]
+  },
+  'news.ycombinator.com': {
+    feed: 'the front page',
+    needs: [
+      { id: 'thread', label: 'One thread someone sent me', coach: 'one thread someone actually sent me', you: 'one thread' },
+      { id: 'research', label: "A question I'm researching", coach: 'a specific question I am researching', you: 'one question' }
+    ]
+  },
+  'substack.com': {
+    feed: 'browsing recommendations',
+    needs: [
+      { id: 'issue', label: 'One post I subscribed to', coach: 'one post from something I actually subscribe to', you: 'a post you subscribe to' },
+      { id: 'own', label: 'Writing my own', coach: 'writing or checking my own newsletter', you: 'your own writing' }
+    ]
+  },
+  'pinterest.com': {
+    feed: 'the home feed',
+    needs: [
+      { id: 'making', label: "Something I'm actually making", coach: 'a board for something I am actually making', you: 'something you are making' },
+      { id: 'idea', label: 'One specific idea', coach: 'looking up one specific idea', you: 'one idea' }
+    ]
+  },
+  'discord.com': {
+    feed: 'scrolling channels',
+    needs: [
+      SERVICE_NEED.dm,
+      { id: 'server', label: 'One server I work in', coach: 'one server I actually work in', you: 'one server' },
+      { id: 'call', label: "A call I'm meant to be on", coach: 'a call I am meant to be on', you: 'a call' }
+    ]
+  },
+  'tumblr.com': {
+    feed: 'the dashboard',
+    needs: [
+      SERVICE_NEED.dm,
+      { id: 'own', label: 'My own blog', coach: 'posting or checking my own blog', you: 'your own blog' }
+    ]
+  }
+};
+
+// A hand-typed domain, or an Android package outside APP_ICON_SITE. The four
+// chips are deliberately generic: "a message reply", "something someone sent
+// me", "one specific thing I need" and "it's part of my job" apply to very
+// nearly anything a person blocks, which is the only honest thing to offer
+// when we know nothing else about it.
+const SERVICE_ANSWERS_FALLBACK = {
+  feed: "browsing once you're in",
+  needs: [
+    SERVICE_NEED.dm,
+    SERVICE_NEED.sent,
+    { id: 'specific', label: 'One specific thing I need', coach: 'one specific thing I already know I need', you: 'one specific thing' },
+    SERVICE_NEED.work
+  ]
+};
+
+// What the wizard renders for one service: the feed it pushes back on, the
+// needs list with the "nothing" chip appended, and the cost list.
+//
+// The "nothing" chip is appended here rather than written into any list so it
+// can never be missing, never be duplicated, and never be anywhere but last.
+function serviceAnswerCatalogue(key) {
+  const entry = SERVICE_ANSWERS[serviceKeyFor(key)] || SERVICE_ANSWERS_FALLBACK;
+  return {
+    feed: entry.feed,
+    needs: [...entry.needs, SERVICE_NEED_NONE],
+    costs: entry.costs || SERVICE_COSTS_DEFAULT
+  };
+}
+
+// One chip by id, or null. `bucket` is 'needs' or 'costs'. Returning null
+// rather than throwing matters: a draft written before a chip was renamed
+// resolves to nothing and is simply dropped from the composed prose.
+function serviceAnswerChip(key, bucket, chipId) {
+  const catalogue = serviceAnswerCatalogue(key);
+  const list = bucket === 'costs' ? catalogue.costs : catalogue.needs;
+  return list.find(chip => chip.id === chipId) || null;
+}
+
+// Fragments -> one sentence. Several taps read as a list, so they are joined
+// with semicolons inside one sentence rather than as four sentences of four
+// words each, which is what the coach would otherwise be handed.
+function composeAnswerSentence(fragments) {
+  const joined = (fragments || [])
+    .map(f => String(f == null ? '' : f).trim())
+    .filter(Boolean)
+    .join('; ');
+  if (!joined) return '';
+  const capped = joined.charAt(0).toUpperCase() + joined.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
+}
+
+// Chip ids -> the { purpose, legitimateUse } pair that has always been stored.
+//
+// This lives here rather than in options-wizard.js because it is pure and the
+// catalogue it reads is here; the wizard only ever holds ids. `answers` is
+// { needs, costs, needsNote, costsNote } straight off setupDraft.serviceAnswers.
+function composeServiceReason(key, answers) {
+  const a = answers || {};
+  const needs = Array.isArray(a.needs) ? a.needs : [];
+  const costs = Array.isArray(a.costs) ? a.costs : [];
+  const fragments = (bucket, ids) => ids
+    .map(id => serviceAnswerChip(key, bucket, id))
+    .filter(chip => chip && chip.coach)
+    .map(chip => chip.coach);
+
+  // "Nothing — I just want it gone" is not the absence of an answer, it is the
+  // strongest answer available, so it composes to a sentence of its own rather
+  // than to an empty string that collectServiceReasons would then drop.
+  const legitimateUse = needs.includes(NEED_NONE_ID)
+    ? NEED_NONE_PROSE
+    : [composeAnswerSentence(fragments('needs', needs)), composeAnswerSentence([a.needsNote])]
+      .filter(Boolean).join(' ');
+
+  const purpose = [composeAnswerSentence(fragments('costs', costs)), composeAnswerSentence([a.costsNote])]
+    .filter(Boolean).join(' ');
+
+  return { purpose, legitimateUse };
+}

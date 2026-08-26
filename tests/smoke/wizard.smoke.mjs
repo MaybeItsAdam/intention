@@ -33,7 +33,6 @@ const visibleStep = (page) => page.evaluate(() => {
   return {
     ids: shown.map(s => s.id),
     title: shown[0]?.querySelector('h3')?.textContent || '',
-    members: document.getElementById('setup-purpose-members')?.textContent || '',
     label: document.getElementById('setup-progress-label').textContent
   };
 });
@@ -71,8 +70,8 @@ async function main() {
     record('opens on the welcome step', step.ids.join() === 'setup-step-welcome', JSON.stringify(step));
 
     const agenda = await page.textContent('#setup-welcome-checklist');
-    record('the welcome agenda warns the questions are coming',
-      /for each site/i.test(agenda), agenda.slice(0, 200));
+    record('the welcome agenda promises ONE screen for the questions',
+      /one screen for what each one is for/i.test(agenda), agenda.slice(0, 200));
 
     // ── Pick two sites. This is a browser build, so there is no apps step.
     await next(page);
@@ -102,67 +101,181 @@ async function main() {
     const drafted = await page.evaluate(() => setupDomainLimits['instagram.com']?.looseUntilMinutes);
     record('a change on it lands in the draft with no coach gate', drafted === 3, String(drafted));
 
-    // The counter has to grow the moment the list does — the whole point of
-    // recomputing the order inside refreshSetupNav. A browser build is
-    // welcome + sites + mode + access + done, so two sites make seven.
+    // ── The counter must NOT move when the list does. This is the inverse of
+    // what this test used to assert: the per-service questions were one step
+    // each, so two sites made seven steps and a third made eight — the
+    // denominator moving under the finger of the person adding them. A browser
+    // build is welcome + sites + purpose + mode + access + done, always six.
     step = await visibleStep(page);
-    record('the step count grows with the blocklist',
-      step.label === 'Step 2 of 7', step.label);
+    record('the step count is a constant six on a browser build',
+      step.label === 'Step 2 of 6', step.label);
 
-    // ── Straight from the sites list into one screen per service. The general
-    // "what are you protecting" step used to sit in between.
+    await page.evaluate(() => addDomainToBlocklist('example.org', 10));
+    await page.waitForTimeout(80);
+    step = await visibleStep(page);
+    record('and adding a third site does not move it',
+      step.label === 'Step 2 of 6', step.label);
+
+    // Back to two, through the row's own Remove button.
+    await page.click('#setup-websites-list li:last-child .delete-btn');
+    await page.waitForTimeout(80);
+    const remaining = await page.locator('#setup-websites-list li').count();
+    record('removing it leaves the other two', remaining === 2, `found ${remaining}`);
+
+    // ── One screen, one card per service.
     await next(page);
     step = await visibleStep(page);
-    record('the first per-service screen is Instagram, named from the catalogue',
-      step.ids.join() === 'setup-step-purpose' && step.title === 'Instagram',
-      JSON.stringify(step));
+    record('reaches the single purpose step',
+      step.ids.join() === 'setup-step-purpose', JSON.stringify(step));
 
-    const whyLabel = await page.textContent('#setup-purpose-why-label');
-    record('the question names the service',
-      whyLabel.includes('Instagram'), whyLabel);
+    const stack = () => page.evaluate(() => [...document.querySelectorAll('#setup-purpose-stack .setup-service')]
+      .map(li => ({
+        service: li.dataset.service,
+        name: li.querySelector('.setup-service-name').textContent,
+        open: li.querySelector('.setup-service-head').getAttribute('aria-expanded') === 'true',
+        state: li.querySelector('.setup-service-state').textContent,
+        preview: li.querySelector('.setup-service-preview').textContent,
+        next: li.querySelector('.setup-service-next').textContent
+      })));
 
-    // "Step 3 of 7" says where you are in the wizard but not how much of the
-    // per-service run is left, which is the bit that reads as endless.
-    record('the run says how long it is',
-      step.members.startsWith('1 of 2'), step.members);
+    let cards = await stack();
+    record('one card per service, named from the catalogue',
+      cards.length === 2 && cards[0].name === 'Instagram' && cards[1].name === 'some-blog.example',
+      JSON.stringify(cards.map(c => c.name)));
+    record('the first is open and the rest are collapsed',
+      cards[0].open === true && cards[1].open === false, JSON.stringify(cards.map(c => c.open)));
+    record('the last card does not pretend there is another one after it',
+      cards[0].next === 'Next: some-blog.example' && /that's all of them/.test(cards[1].next),
+      JSON.stringify(cards.map(c => c.next)));
 
-    await page.fill('#setup-purpose-why-input', 'DMs from my sister.');
-    await page.fill('#setup-purpose-legit-input', 'A specific reply. Never the feed.');
-    await page.locator('#setup-purpose-legit-input').blur();
+    const counter = () => page.textContent('#setup-purpose-count');
+    record('the run says how long it is, in its own counter',
+      (await counter()) === '0 of 2 answered', await counter());
 
-    // ── The section is reused, so the real risk is it not repainting.
-    await next(page);
-    step = await visibleStep(page);
-    record('the second service repaints the same section',
-      step.ids.join() === 'setup-step-purpose' && step.title === 'some-blog.example',
-      JSON.stringify(step));
+    // ── A tap is the whole interaction, and the preview is what makes it read
+    // as a consequence rather than a form field.
+    const chip = (service, bucket, id) =>
+      page.locator(`[data-service="${service}"] [data-bucket="${bucket}"][data-chip="${id}"]`);
 
-    const carried = await page.inputValue('#setup-purpose-why-input');
-    record('it does not carry the previous service\'s answer over', carried === '', carried);
+    await chip('instagram.com', 'needs', 'dm').click();
+    await page.waitForTimeout(60);
+    cards = await stack();
+    record('tapping a chip presses it',
+      (await chip('instagram.com', 'needs', 'dm').getAttribute('aria-pressed')) === 'true');
+    record('and rewrites the preview into what the coach will do',
+      cards[0].preview === 'Your coach will hear you out for a DM reply — and push back on the feed, Reels and Explore.',
+      cards[0].preview);
+    record('and marks the card answered', cards[0].state === 'Answered', cards[0].state);
+    record('and moves the stack counter', (await counter()) === '1 of 2 answered', await counter());
 
-    await page.fill('#setup-purpose-why-input', 'Reading one author.');
-    await page.locator('#setup-purpose-why-input').blur();
+    await chip('instagram.com', 'needs', 'sent').click();
+    await page.waitForTimeout(60);
+    cards = await stack();
+    record('a second chip joins the first in the preview',
+      cards[0].preview.includes('a DM reply or a link someone sent you'), cards[0].preview);
 
-    // ── A draft written on a per-service screen has to come back to it. The
-    // step used to be stored as a bare index, which stops meaning anything
-    // once the length depends on the blocklist.
+    // The free text is a refinement under the chips, not the main event: it
+    // has to be revealed before it can be typed into.
+    const noteToggle = (service, i) =>
+      page.locator(`[data-service="${service}"] .setup-service-note-toggle`).nth(i);
+    const note = (service, i) =>
+      page.locator(`[data-service="${service}"] .setup-service-note`).nth(i);
+
+    // ── The phone case, and the one that used to lose the answer outright.
+    //
+    // Every chip click repaints the card, and the repaint syncs each textarea
+    // back from the stored answer. On a phone the textarea has not blurred
+    // when that happens: iOS Safari and the Android WebView do not reliably
+    // move focus to a <button> on tap, so no 'change' event has fired and the
+    // stored answer is still empty — which is what the repaint wrote over the
+    // half-typed sentence. A dispatched click reproduces exactly that here: it
+    // runs the chip's handler without moving focus, which a real Playwright
+    // click (Chromium DOES focus a button) would not.
+    await noteToggle('instagram.com', 0).click();
+    await note('instagram.com', 0).click();
+    await note('instagram.com', 0).pressSequentially('Only my sister messages, never the feed');
+    await chip('instagram.com', 'costs', 'hours').dispatchEvent('click');
+    await page.waitForTimeout(60);
+    const stillFocused = await page.evaluate(() =>
+      document.activeElement?.classList.contains('setup-service-note'));
+    record('a tap that does not move focus is what the repro needs', stillFocused === true,
+      String(stillFocused));
+    const survived = await note('instagram.com', 0).inputValue();
+    record('a chip tapped with the keyboard still up does not wipe the note',
+      survived === 'Only my sister messages, never the feed', JSON.stringify(survived));
+
+    // ...and the keystrokes reached the answer object, so Finish would save
+    // them even if this textarea never blurs at all.
+    const banked = await page.evaluate(() => setupServiceAnswers['instagram.com']?.needsNote);
+    record('and the typed sentence is already banked in the draft answers',
+      banked === 'Only my sister messages, never the feed', JSON.stringify(banked));
+
+    await chip('instagram.com', 'costs', 'hours').dispatchEvent('click');
+    await page.waitForTimeout(60);
+
+    await note('instagram.com', 0).fill('A specific reply. Never the feed.');
+    await note('instagram.com', 0).blur();
+    await page.waitForTimeout(60);
+
+    // The cost side's own note. Left as free text here so the tail of this
+    // file — the settings row, the app pairing, the gated second write — reads
+    // exactly the same prose it always did, which is the proof that the
+    // storage shape did not move when the input did.
+    await noteToggle('instagram.com', 1).click();
+    await note('instagram.com', 1).fill('DMs from my sister.');
+    await note('instagram.com', 1).blur();
+    await page.waitForTimeout(60);
+
+    // ── The footer button moves the accordion on, and it is the thing a phone
+    // user actually presses.
+    await page.click('[data-service="instagram.com"] .setup-service-next');
+    await page.waitForTimeout(60);
+    cards = await stack();
+    record('Next collapses the card and opens the following one',
+      cards[0].open === false && cards[1].open === true, JSON.stringify(cards.map(c => c.open)));
+
+    // ── The draft round-trip. This is where the old per-service index bug
+    // lived: the step is stored, and so is which card was open.
     await page.reload();
     await page.waitForSelector('#setup-view:not([hidden])');
-    await page.waitForTimeout(120);
+    await page.waitForTimeout(150);
     step = await visibleStep(page);
-    record('a reload returns to the same service, not to step 1',
-      step.ids.join() === 'setup-step-purpose' && step.title === 'some-blog.example',
-      JSON.stringify(step));
-    record('and the answer typed before the reload is still there',
-      (await page.inputValue('#setup-purpose-why-input')) === 'Reading one author.');
+    cards = await stack();
+    record('a reload returns to the purpose step, not to step 1',
+      step.ids.join() === 'setup-step-purpose', JSON.stringify(step));
+    record('the denominator is the same six it was before the reload',
+      step.label === 'Step 3 of 6', step.label);
+    record('the chip tapped before the reload is still pressed',
+      (await chip('instagram.com', 'needs', 'dm').getAttribute('aria-pressed')) === 'true');
+    record('and the card that was open is still the open one',
+      cards[1].open === true, JSON.stringify(cards.map(c => c.open)));
 
-    // ── Skip jumps the whole run, not one screen.
-    await page.click('#setup-back-btn');
+    // ── "Nothing — I just want it gone" is exclusive in both directions.
+    await chip('some-blog.example', 'needs', 'sent').click();
     await page.waitForTimeout(60);
+    await chip('some-blog.example', 'needs', 'none').click();
+    await page.waitForTimeout(60);
+    cards = await stack();
+    record('the "nothing" chip clears the reasons beside it',
+      (await chip('some-blog.example', 'needs', 'sent').getAttribute('aria-pressed')) === 'false');
+    record('and swaps the preview to starting from no',
+      /start every visit from no/.test(cards[1].preview), cards[1].preview);
+    record('and says so on the collapsed head', cards[1].state === 'Blocked outright', cards[1].state);
+
+    await chip('some-blog.example', 'needs', 'none').click();
+    await page.waitForTimeout(60);
+
+    await noteToggle('some-blog.example', 1).click();
+    await note('some-blog.example', 1).fill('Reading one author.');
+    await note('some-blog.example', 1).blur();
+    await page.waitForTimeout(60);
+
+    // ── Skip is the way past the whole step, and it must not be the way past
+    // the wizard.
     await page.click('#setup-purpose-skip-btn');
     await page.waitForTimeout(60);
     step = await visibleStep(page);
-    record('Skip clears every remaining service, not just this one',
+    record('Skip leaves the questions behind and lands on the mode step',
       step.ids.join() === 'setup-step-mode', JSON.stringify(step));
 
     // ── Simple mode must not change the denominator (the bug the access step

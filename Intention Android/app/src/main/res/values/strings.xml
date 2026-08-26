@@ -1,5 +1,50 @@
 <resources>
     <string name="app_name">Intention</string>
     <string name="accessibility_service_label">Intention App Blocker</string>
-    <string name="accessibility_service_description">Monitors app launches and, in supported browsers, the address bar to block distracting apps and websites, helping you practice mindfulness via the Intention AI Coach.</string>
+    <!-- This is the accessibility declaration the user reads in Settings and
+         the wording the Play Permissions Declaration Form has to agree with,
+         so it names every use, and there are now three: which app is in the
+         foreground; which section of that app is on screen (Reels, DMs) so a
+         rule that blocks only part of an app can be honoured; and whether
+         Settings is showing Intention's own page or the Accessibility entry
+         for this service, so the leaving conversation can be offered once
+         before someone switches the blocking off. Nothing here automates the
+         other app — the service reads, it never presses — and the AI coach is
+         never shown an accessibility node. See the header of AppParts.kt and
+         the leaving section in IntentionAccessibilityService.kt.
+
+         The last of the three is the newest, and the Play Permissions
+         Declaration Form must be updated to describe it BEFORE the next
+         publish-android.yml run. A description that names a use the form does
+         not is worse than either on its own. -->
+    <string name="accessibility_service_description">Monitors app launches and, in supported browsers, the address bar to block distracting apps and websites. Where you have chosen to block only part of an app, it also reads which section of that app is on screen (for example Reels rather than messages) so that only the section you chose is blocked. It also notices when you open Intention\'s own page in Settings, or the Accessibility settings for this service, and offers you a conversation with your coach before you switch it off or uninstall — it never blocks either, and never taps anything for you. It never controls or automates the apps you use. This helps you practice mindfulness via the Intention AI Coach.</string>
+
+    <!-- The in-app warning shown when in-app section detection keeps failing.
+         The view IDs it relies on are internal to the apps themselves, so an
+         app update can silently stop them matching; this card is how the user
+         finds out from Intention rather than from a rule that quietly stopped
+         working. Every degradation now blocks the target in full — see the
+         header of AppParts.kt — so the three bodies differ in what went wrong
+         and what to do about it, not in what is happening. -->
+    <string name="part_detection_warning_eyebrow">HEADS UP</string>
+    <string name="part_detection_warning_title">Can\'t tell which part of %1$s is on screen</string>
+    <string name="part_detection_warning_body_only">You asked for only part of %1$s to be blocked. On this device Intention can\'t currently tell that app\'s sections apart — usually because the app has updated, or because your phone\'s language isn\'t one it can read the labels in — so rather than let %1$s open unchecked it has been blocking all of it. Everything else on your list is unaffected.</string>
+    <string name="part_detection_warning_body_only_refused">You asked for only part of %1$s to be blocked, but the part you chose isn\'t one this version of Intention can recognise on this device. Rather than let %1$s open unchecked, it has been blocking all of it. Everything else on your list is unaffected.</string>
+    <string name="part_detection_warning_body_except">You asked for all of %1$s to be blocked except one part. On this device Intention can\'t currently tell that app\'s sections apart — usually because the app has updated, or because your phone\'s language isn\'t one it can read the labels in — so it has been blocking all of %1$s, including the part you carved out. Everything else on your list is unaffected.</string>
+    <string name="part_detection_warning_block_all">Block all of it</string>
+    <string name="part_detection_warning_dismiss">Keep trying</string>
+    <string name="part_detection_warning_blocked_toast">%1$s is now blocked in full. You can narrow it again in Settings.</string>
+
+    <!-- The same admission, said at the gate instead of in the app.
+         AppParts blocks the whole app whenever it cannot work out which
+         section is on screen, so someone who asked for only part of an app to
+         be blocked can meet a gate they were told they would not meet. The
+         warning card above only reaches them inside Intention, which is not
+         where they are; this is one line above the coach, at the moment it
+         matters. Two wordings because the two causes suggest different
+         repairs — see AppParts.DetectionWarning. Kept to one sentence plus the
+         way out: the coach below it is both the exit and the place the rule is
+         changed. -->
+    <string name="part_gate_notice_unresolved">Intention can\'t tell which part of %1$s this is, so it\'s blocking all of %1$s for now. Change or remove that rule in Intention\'s settings.</string>
+    <string name="part_gate_notice_refused">Intention can\'t recognise the part of %1$s you picked, so it\'s blocking all of %1$s. Choose a different part, or block the app outright, in Intention\'s settings.</string>
 </resources>

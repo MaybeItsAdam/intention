@@ -109,6 +109,27 @@
     getAppUsageStats: function(days, callback) {
       const cbId = window.AndroidCallbacks.register(callback);
       AndroidInterface.getAppUsageStats(days, cbId);
+    },
+    // Leaving Intention, from the page side.
+    //
+    // Deliberately NOT a straight call to AndroidInterface.requestUninstall().
+    // Removal is two things — recording that the leaving conversation ended,
+    // and actually taking the app off the device — and the first of them is
+    // background.js's job on every platform (completeRemoval -> beginLeave,
+    // which writes the fifteen-minute stand-down). Sending the same message
+    // the browser build sends keeps one definition of that, and
+    // WebAppInterface.sendMessage turns it into the system uninstaller on the
+    // way past. So both doors — this one and shared/options.js's own
+    // `completeRemoval` — end up in exactly the same place.
+    //
+    // Handoff: shared/options.js currently reaches the uninstaller through
+    // that message rather than through this function, which is why this file
+    // is the only thing that has to know Android is different. If a later
+    // package does feature-detect `window.intentionApps.requestUninstall`,
+    // this is the shape to call: it is the whole sequence, not just the last
+    // step of it.
+    requestUninstall: function(callback) {
+      window.chrome.runtime.sendMessage({ action: 'completeRemoval' }, callback);
     }
   };
 })();

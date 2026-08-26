@@ -3,7 +3,9 @@ package uk.co.maybeitssoftware.intention
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -56,6 +58,14 @@ object BillingManager : PurchasesUpdatedListener {
     private val PRODUCT_IDS = listOf(PRODUCT_CREDIT_1, PRODUCT_CREDIT_2, PRODUCT_CREDIT_5)
 
     private const val PLAY_STORE_PACKAGE = "com.android.vending"
+
+    // Named here because res/xml/backup_rules.xml and
+    // res/xml/data_extraction_rules.xml both list this file by hand as the one
+    // thing Intention backs up — a self-blocking app must not restore its own
+    // blocking state, but must never lose the account id that keys a paid
+    // balance. Renaming this string silently un-backs-up that balance, so it
+    // is a constant with a comment rather than a literal in two places.
+    private const val BILLING_PREFS = "intention_billing"
 
     // How long redeem() waits for a Play-side grant to show up (~2 minutes).
     private const val REDEEM_POLL_INTERVAL_MS = 2_000L
@@ -458,11 +468,98 @@ object BillingManager : PurchasesUpdatedListener {
     }
 
     private fun stableAccountId(context: Context): String {
-        val prefs = context.getSharedPreferences("intention_billing", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences(BILLING_PREFS, Context.MODE_PRIVATE)
         prefs.getString("account_id", null)?.let { return it }
         val newId = UUID.randomUUID().toString()
-        prefs.edit().putString("account_id", newId).apply()
+        // Stamped only when the id is minted, never on a read, and never
+        // back-filled onto an id that predates this field. Back-filling would
+        // set it to "now" for someone who has had the same id for months and
+        // so make accountTokenRestored() below call their perfectly good
+        // account freshly minted forever after. An id with no stamp is the
+        // honest "we cannot tell" case and is treated as such.
+        prefs.edit()
+            .putString("account_id", newId)
+            .putLong("account_id_minted_at", System.currentTimeMillis())
+            .apply()
         return newId
+    }
+
+    /**
+     * Did this device's account id arrive from a backup or a device transfer,
+     * rather than being minted here?
+     *
+     * It matters because the id is the only durable link between a device and
+     * a paid balance: a top-up is a consumable, consumed the moment it is
+     * credited, so Play will never re-report it and there is nothing else left
+     * to prove the purchase with. If the id came back, silent recovery
+     * (`POST /v1/entitlement/recover`) will find the balance. If we minted it
+     * on this install, the old balance is still on the server but nothing on
+     * this device can name it, and only the written-down recovery code can
+     * reach it.
+     *
+     * The comparison is `minted_at < firstInstallTime`. Auto Backup restores
+     * the whole of intention_billing.xml, so a restored id brings the ORIGINAL
+     * device's timestamp with it, which is necessarily older than this
+     * install; an id minted here is stamped seconds after the install and so
+     * is necessarily newer. An app *update* leaves firstInstallTime alone,
+     * which is what we want — an update restores nothing and changes nothing.
+     *
+     * The honest gap this exists to detect: Auto Backup runs roughly daily, on
+     * Wi-Fi, charging and idle, and restores only at install time. A same-day
+     * uninstall-and-reinstall will not have a restored id, and no amount of
+     * cleverness here changes that — which is precisely why the answer is
+     * reported rather than papered over.
+     *
+     * The answer is genuinely three-valued, so the return type is too. `null`
+     * is "cannot tell", and there are three honest ways to get there: no
+     * context yet, no stamp because the id predates this field (which is EVERY
+     * install that existed before the release adding it, since stableAccountId
+     * stamps only on mint and nothing back-fills), and PackageManager refusing
+     * to answer. `true` is an assertion that something put the id back, and
+     * `false` an assertion that it was minted here; both are only ever
+     * returned when the timestamps actually say so.
+     *
+     * Collapsing "cannot tell" into `true` — which is what this used to do —
+     * is not the conservative direction, it is a claim. shared/billing.js's
+     * storeAccountRestored() is explicit that `undefined` means "this build
+     * cannot tell" and that every caller must treat it as "say nothing" rather
+     * than as false; Apple's bridge already answers that way by omitting the
+     * field. Today's only consumer tests `accountRestored === false`, so a
+     * wrong `true` merely fails soft — but the first caller to write
+     * `if (accountRestored)` would tell every install predating this field
+     * that its account had been restored from a backup that never existed.
+     *
+     * `null` reaches the web layer as an ABSENT key, not as JSON null:
+     * WebAppInterface builds the reply with `JSONObject.put(String, Object)`,
+     * which removes the mapping when the value is null rather than storing
+     * one. So the wire shape for "cannot tell" is `{"token":"..."}` —
+     * byte-identical to what Apple's accountToken() sends, and read back as
+     * `undefined` by storeAccountRestored(). That is also why this fix needs
+     * no change at the call site, and why an older web layer that reads only
+     * `token` is unaffected.
+     */
+    fun accountTokenRestored(): Boolean? {
+        val context = appContext ?: return null
+        val prefs = context.getSharedPreferences(BILLING_PREFS, Context.MODE_PRIVATE)
+        val mintedAt = prefs.getLong("account_id_minted_at", 0L)
+        if (mintedAt <= 0L) return null
+        return try {
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.PackageInfoFlags.of(0L)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            }
+            mintedAt < info.firstInstallTime
+        } catch (e: PackageManager.NameNotFoundException) {
+            // Our own package always exists, so this is unreachable in
+            // practice; if the platform ever disagrees, say "cannot tell".
+            Log.w(TAG, "Could not read firstInstallTime: ${e.message}")
+            null
+        }
     }
 
     private fun purchaseResult(purchase: Purchase): JSONObject =

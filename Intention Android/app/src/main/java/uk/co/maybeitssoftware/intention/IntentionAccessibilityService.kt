@@ -76,6 +76,79 @@ class IntentionAccessibilityService : AccessibilityService() {
             "com.cloudmosa.puffinFree" to listOf("address_bar", "url"),
             "com.cloudmosa.puffin" to listOf("address_bar", "url")
         )
+
+        // ===================================================================
+        // LEAVING: INTERPOSING WHEN THE USER HEADS FOR UNINSTALL
+        // ===================================================================
+        //
+        // The boundary first, because it is the licence to ship any of this:
+        // the coach NEVER reads an accessibility node, and NEVER drives an
+        // accessibility action. Everything below answers exactly one question
+        // — "is Settings showing Intention's own App info page, or this
+        // service's own page under Accessibility?" — from the fixed table of
+        // package names and view-id suffixes compiled into the APK, and its
+        // only response is to launch OUR OWN activity. From there it is the
+        // ordinary WebView flow: the same leaving conversation the browser
+        // build opens at options.html?leave=1, one flow with two entry points.
+        //
+        // Note "this service's own page", not "the Accessibility list". An
+        // earlier version matched the list, which is to say it matched every
+        // accessibility service installed on the device, ours among them;
+        // the head of RemovalSurface.kt records what that cost the user who
+        // had gone there for a screen reader.
+        // The model is never shown a node, never asked what to look for, and
+        // cannot press anything. Play's AccessibilityService policy requires
+        // this automation to be deterministic, rule-based and script-
+        // following; a `setOf` of literals and a bounded walk is what that
+        // looks like. If a future change lets the model choose what to match
+        // on, or lets anything here call `performAction`, the app becomes
+        // removable from Play — the same rule the head of AppParts.kt states.
+        //
+        // Deliberately NOT performGlobalAction(GLOBAL_ACTION_BACK). Fighting
+        // the user for control of the Back button is the behaviour that gets
+        // an accessibility app pulled, and worse, it traps people: they are
+        // pressing the one control that is supposed to always work and it is
+        // not working. Launching over the top interrupts just as well, is
+        // dismissible with the very Back press we refuse to steal, and leaves
+        // Settings exactly where they left it for when they come back to
+        // finish the job. They can always finish the job.
+        //
+        // The Play Permissions Declaration Form must describe this use BEFORE
+        // the next publish-android.yml run. That is a release blocker, not a
+        // code detail.
+
+        // Settings, as shipped by AOSP and by the skins that replace it. A
+        // package missing from here costs nothing but silence on that device;
+        // a wrong one costs a walk over an unrelated app's window, which is
+        // why this is a fixed set rather than anything matched by prefix.
+        private val SETTINGS_PACKAGES = setOf(
+            "com.android.settings",
+            "com.samsung.android.settings",
+            "com.miui.securitycenter",
+            "com.oplus.settings",
+            "com.coloros.settings"
+        )
+
+        // Both floors under how often our activity can appear — the ten-minute
+        // debounce and the fifteen-minute stand-down after every outcome —
+        // live in LeavePolicy, in shared storage, where a restart of this
+        // service process cannot reset them. They used to be a field on this
+        // class and thirty seconds long, which is a rate limit rather than a
+        // floor; read the head of LeavePolicy.kt before changing either.
+
+        // The bounded walk, with the same numbers and the same reasoning as
+        // AppParts.MAX_NODES/MAX_DEPTH — held separately because that bound is
+        // tuned for finding a tab strip inside a feed and this one is tuned for
+        // finding a header on a Settings page; a future change to either
+        // should not silently move the other. 400 handles covers an App info
+        // page in full, 12 levels covers its preference list.
+        private const val REMOVAL_WALK_MAX_NODES = 400
+        private const val REMOVAL_WALK_MAX_DEPTH = 12
+
+        // Which shapes count as "Settings is showing Intention's own page" is
+        // RemovalSurfaceMatcher's, not this class's: it is a decision worth
+        // testing without a device, and the view ids it turns on belong next
+        // to the reasoning about why each one is safe.
     }
 
     private val lastContentCheckAt = mutableMapOf<String, Long>()
@@ -148,12 +221,47 @@ class IntentionAccessibilityService : AccessibilityService() {
             Log.d(TAG, "Foreground app changed to: $packageName")
             lastForegroundPackage = packageName
 
+            // On a window state change only, never on the content changes a
+            // scrolling Settings list emits by the dozen — see the head of the
+            // leaving section in the companion above. Returning when it fired
+            // is not a policy, just an economy: our own activity is in front
+            // now, so evaluating this Settings window as a blockable app or a
+            // browser would be answering a question about a window nobody is
+            // looking at.
+            if (packageName in SETTINGS_PACKAGES && checkRemovalSurface(event)) return
+
             if (isAppBlocked(packageName)) {
                 Log.d(TAG, "App is blocked: $packageName. Checking for active session...")
                 val expiresAt = sessionExpiresAt(packageName)
                 if (expiresAt == null) {
-                    Log.d(TAG, "No active session for $packageName. Blocking and launching Coach!")
-                    launchCoachingOverlay(packageName, isApp = true, label = getAppLabel(packageName))
+                    // "Block only Reels" is answered here, and only here — on a
+                    // window state change, never on the content changes a
+                    // scrolling feed emits by the dozen. AppParts costs one
+                    // prefs read when the target has no part rule, which is
+                    // every target that existed before this feature, so the
+                    // common path is unchanged. Only a screen we positively
+                    // recognised as outside the rule lets the app through:
+                    // every flavour of "we could not tell" gates, for both
+                    // scopes. See the head of AppParts.kt for why that is the
+                    // right way round with an unverified table, and why the
+                    // gate has to say so when it happens.
+                    val verdict = AppParts.verdictForApp(this, packageName) {
+                        rootInActiveWindow ?: getRootFromEvent(event)
+                    }
+                    if (verdict.gated) {
+                        Log.d(TAG, "No active session for $packageName. Blocking and launching Coach!")
+                        launchCoachingOverlay(
+                            packageName,
+                            isApp = true,
+                            label = getAppLabel(packageName),
+                            partNotice = partNoticeFor(verdict)
+                        )
+                    } else {
+                        // partId is never null here: the only way past the
+                        // gate now is a screen we positively recognised.
+                        Log.d(TAG, "No active session for $packageName, but its part rule does not " +
+                            "cover this section (${verdict.partId}). Letting it through.")
+                    }
                 } else {
                     Log.d(TAG, "Active session exists for $packageName. Allowing access until $expiresAt.")
                     scheduleExpiryRecheck(expiresAt)
@@ -311,13 +419,23 @@ class IntentionAccessibilityService : AccessibilityService() {
         if (isAppBlocked(packageName)) {
             val expiresAt = sessionExpiresAt(packageName)
             if (expiresAt == null) {
-                Log.d(TAG, "Session expired while $packageName in foreground. Launching Coach!")
-                launchCoachingOverlay(
-                    packageName,
-                    isApp = true,
-                    label = getAppLabel(packageName),
-                    mode = if (justExpired(packageName)) MODE_CHECKIN else MODE_GATE
-                )
+                // The same part check as the foreground path. This one is
+                // driven by a timer rather than an event, so it happens once
+                // when a pass runs out — it is not the per-event walk the
+                // bound in AppParts exists to prevent — and skipping it would
+                // mean a pass expiring while the user is in their DMs gates
+                // them out of a section their rule never covered.
+                val verdict = AppParts.verdictForApp(this, packageName) { root }
+                if (verdict.gated) {
+                    Log.d(TAG, "Session expired while $packageName in foreground. Launching Coach!")
+                    launchCoachingOverlay(
+                        packageName,
+                        isApp = true,
+                        label = getAppLabel(packageName),
+                        mode = if (justExpired(packageName)) MODE_CHECKIN else MODE_GATE,
+                        partNotice = partNoticeFor(verdict)
+                    )
+                }
             } else {
                 scheduleExpiryRecheck(expiresAt)
             }
@@ -496,12 +614,147 @@ class IntentionAccessibilityService : AccessibilityService() {
         return sinceExpiry in 0..CHECKIN_WINDOW_MS
     }
 
+    // =======================================================================
+    // LEAVING: THE ONE QUESTION THIS SERVICE ANSWERS ABOUT SETTINGS
+    // =======================================================================
+
+    /**
+     * "Is Settings showing Intention's own App info page, or the Accessibility
+     * entry for this service?" — and if so, open the leaving conversation over
+     * the top of it. Returns whether it launched, which is the caller's cue to
+     * stop evaluating a window that is no longer in front.
+     *
+     * The order of the two checks is the whole performance story. This runs on
+     * every window state change inside Settings, and only the second of them
+     * crosses into another app's process:
+     *
+     *   1. the stored leaving policy (LeavePolicy), which is a
+     *      SharedPreferences read the OS has already cached in this process —
+     *      and which is where BOTH floors now live, so a restart of this
+     *      service cannot wipe them;
+     *   2. the bounded walk.
+     *
+     * So the walk only happens on a screen change we would actually act on.
+     *
+     * What is NOT here: the uninstall confirmation dialog. That dialog belongs
+     * to the package installer, not to Settings, and it is deliberately left
+     * alone twice over — a user who has already tapped Uninstall and is
+     * looking at the system's own "are you sure" has made the decision, and
+     * interrupting it is the fighting-for-control shape this whole feature
+     * refuses; and it is the very dialog our own WebAppInterface.requestUninstall()
+     * raises at the end of the conversation, so interposing on it would mean
+     * interposing on our own completion.
+     */
+    private fun checkRemovalSurface(event: AccessibilityEvent): Boolean {
+        val now = System.currentTimeMillis()
+        if (!leaveInterposeAllowed(now)) return false
+
+        val root = rootInActiveWindow ?: getRootFromEvent(event) ?: return false
+        if (!isRemovalSurface(root)) return false
+
+        // Spent BEFORE the launch, and durably: the ten-minute debounce and
+        // the fifteen-minute stand-down both. A launch that throws still pays
+        // for the show — an activity we could not start is not a reason to try
+        // again on the next window change — and a dismissal with Back, which
+        // this process never hears about, has already been paid for. See the
+        // head of LeavePolicy.kt.
+        LeavePolicy.recordInterposition(this, now)
+        launchLeavingFlow()
+        return true
+    }
+
+    /**
+     * The bounded walk. Breadth-first, capped at REMOVAL_WALK_MAX_NODES
+     * handles and REMOVAL_WALK_MAX_DEPTH levels, over the visible nodes only.
+     *
+     * WHICH shapes count is RemovalSurfaceMatcher's, and its head is where the
+     * reasoning lives — including why an earlier version of this method
+     * matched every row of Settings -> Accessibility, and what that did to a
+     * user who had gone there for a screen reader. All this method does is
+     * feed it nodes and stop early when it has an answer.
+     */
+    private fun isRemovalSurface(root: AccessibilityNodeInfo): Boolean {
+        val matcher = RemovalSurfaceMatcher(
+            appLabel = getString(R.string.app_name),
+            serviceLabel = getString(R.string.accessibility_service_label),
+            serviceDescription = getString(R.string.accessibility_service_description)
+        )
+        var obtained = 1
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.addLast(root to 0)
+
+        while (queue.isNotEmpty()) {
+            val (node, depth) = queue.removeFirst()
+            if (node.isVisibleToUser &&
+                matcher.observe(node.text?.toString(), node.viewIdResourceName)
+            ) {
+                return true
+            }
+
+            if (depth >= REMOVAL_WALK_MAX_DEPTH) continue
+            val childCount = node.childCount
+            for (i in 0 until childCount) {
+                if (obtained >= REMOVAL_WALK_MAX_NODES) break
+                val child = try { node.getChild(i) } catch (e: Exception) { null } ?: continue
+                obtained++
+                queue.addLast(child to depth + 1)
+            }
+        }
+        return matcher.matched
+    }
+
+    /**
+     * Every reason Intention stays quiet, read out of the same stored state
+     * the browser build reads. The policy itself is LeavePolicy's; this is the
+     * one-line call site kept so the ordering comment above has something to
+     * point at.
+     */
+    private fun leaveInterposeAllowed(now: Long): Boolean = LeavePolicy.allows(this, now)
+
+    // Our own activity, over the top, dismissible. MainActivity is singleTask,
+    // so an instance already in the back stack is handed this through
+    // onNewIntent rather than a second copy being built, and EXTRA_LEAVE takes
+    // its WebView to options.html?leave=1 — the same address the browser
+    // build's tab interposition opens, running the same conversation. One
+    // flow, two entry points.
+    private fun launchLeavingFlow() {
+        Log.d(TAG, "Settings is showing Intention's own page — opening the leaving conversation")
+        try {
+            startActivity(
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    putExtra(MainActivity.EXTRA_LEAVE, true)
+                }
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not open the leaving conversation: ", e)
+        }
+    }
+
+    /**
+     * Which admission, if any, the gate has to carry.
+     *
+     * A part rule that could not be carried out blocks the WHOLE app, which
+     * from the user's side is a rule they wrote being ignored. The miss
+     * counter already records it, but that card is inside the app they are
+     * pointedly not opening; this is how the same fact reaches them at the
+     * only moment it is actually on their mind. Null for every ordinary
+     * block, so the coach is unchanged for everyone whose rules are working
+     * and for every target with no part rule at all.
+     */
+    private fun partNoticeFor(verdict: AppParts.PartVerdict): String? = when {
+        !verdict.degraded -> null
+        verdict.refused -> CoachingActivity.PART_NOTICE_REFUSED
+        else -> CoachingActivity.PART_NOTICE_UNRESOLVED
+    }
+
     private fun launchCoachingOverlay(
         key: String,
         isApp: Boolean,
         label: String,
         browserPackage: String? = null,
-        mode: String = MODE_GATE
+        mode: String = MODE_GATE,
+        partNotice: String? = null
     ) {
         val intent = Intent(this, CoachingActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -510,6 +763,7 @@ class IntentionAccessibilityService : AccessibilityService() {
             putExtra("appLabel", label)
             putExtra("browserPackage", browserPackage)
             putExtra("mode", mode)
+            putExtra(CoachingActivity.EXTRA_PART_NOTICE, partNotice)
         }
         startActivity(intent)
     }

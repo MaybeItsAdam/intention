@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -59,6 +60,50 @@ class WebAppInterface(
             if (action == "openOptions") {
                 openOptions(json.optString("section").takeIf { it.isNotEmpty() })
                 runOnJs("window.AndroidCallbacks.invoke(${JSONObject.quote(callbackId)},'{\"ok\":true}')")
+                return
+            }
+            // ---- Leaving Intention: the two places the shared code asks a
+            // question only the host can answer ----------------------------
+            //
+            // background.js's completeRemoval() ends in
+            // chrome.management.uninstallSelf(), which does not exist on
+            // Android and would not be the right verb if it did: removal here
+            // is an OS-level uninstall of the whole app, not the retirement of
+            // an extension. So the message is still FORWARDED first — that is
+            // what writes the fifteen-minute stand-down, through the same
+            // beginLeave() the browser build uses, and keeping that one
+            // definition is worth more than the round trip costs — and the
+            // removal itself is then performed with the system uninstaller.
+            //
+            // Ordering matters for the same reason it does in the JS: the
+            // stand-down is recorded BEFORE the uninstaller appears, so a user
+            // who reads the system's "are you sure" and decides not to is not
+            // met by the same conversation the moment they walk back into
+            // Settings.
+            if (action == "completeRemoval") {
+                BackgroundJsHelper.sendMessage(messageJson) { _ ->
+                    requestUninstall()
+                    runOnJs("window.AndroidCallbacks.invoke(${JSONObject.quote(callbackId)},'{\"ok\":true}')")
+                }
+                return
+            }
+            // canSelfUninstall is background.js asking "can this build remove
+            // itself?", and it answers false on Android purely because the
+            // background WebView's chrome shim has no management namespace.
+            // On this platform the honest answer is yes — the line above is
+            // how — and it has to be true or the leaving card renders the
+            // "remove it from your device's own settings" note instead of the
+            // button that starts the conversation. Patched on the way out
+            // rather than in shared/options.js, which this package does not
+            // own; see the handoff note in android-bridge.js.
+            if (action == "getLeaveState") {
+                BackgroundJsHelper.sendMessage(messageJson) { response ->
+                    runOnJs(
+                        "window.AndroidCallbacks.invoke(" +
+                            "${JSONObject.quote(callbackId)}," +
+                            "${JSONObject.quote(withNativeUninstall(response))})"
+                    )
+                }
                 return
             }
         } catch (e: Exception) {}
@@ -116,9 +161,28 @@ class WebAppInterface(
     // The device-local UUID a balance is keyed by. billing.js sends it on
     // every verify so a redeemed code — which carries no obfuscatedAccountId
     // of its own — has a balance to land in.
+    //
+    // `restored` rides alongside it and says whether that UUID came back from
+    // a backup or was minted on this install. Silent recovery is attempted
+    // either way; the field only decides what the web layer says when recovery
+    // finds nothing — "no credit here" versus "this looks like a fresh install
+    // and the backup has not caught up, use your recovery code". Additive on
+    // purpose: an older web layer reads only `token` and is unaffected by the
+    // extra key.
+    //
+    // Order matters. accountToken() mints the id if there is none, stamping
+    // account_id_minted_at as it goes; asking whether it was restored has to
+    // happen after that, or a first-ever call would ask about an id that does
+    // not exist yet. Hence two statements rather than one chained expression.
     @JavascriptInterface
     fun billingAccountToken(callbackId: String) {
-        respond(callbackId, JSONObject().put("token", BillingManager.accountToken()))
+        val token = BillingManager.accountToken()
+        respond(
+            callbackId,
+            JSONObject()
+                .put("token", token)
+                .put("restored", BillingManager.accountTokenRestored())
+        )
     }
 
     @JavascriptInterface
@@ -165,6 +229,61 @@ class WebAppInterface(
             array.put(JSONObject().put("packageName", pkg).put("label", label).put("icon", icon))
         }
         runOnJs("window.AndroidCallbacks.invoke(${JSONObject.quote(callbackId)},${JSONObject.quote(array.toString())})")
+    }
+
+    /**
+     * The exit, and it has to work.
+     *
+     * ACTION_DELETE with a `package:` Uri raises the system's own uninstall
+     * confirmation — the OS asks, the OS removes, and Intention is not in the
+     * loop for either. That system dialog IS the friction here, and it is
+     * exactly the right amount: the conversation has already happened by the
+     * time anything calls this.
+     *
+     * The fallback is App info rather than nothing. ACTION_DELETE is honoured
+     * by AOSP and every skin I can find, but it is not a contract, and a ROM
+     * that declines to handle it must not leave the user staring at a button
+     * that silently did nothing — App info is one tap from Uninstall on every
+     * Android there has ever been. ACTION_UNINSTALL_PACKAGE is deliberately
+     * not the fallback: it was deprecated in API 29 and needs
+     * REQUEST_DELETE_PACKAGES, a permission to ask for on the strength of a
+     * ROM we have never seen.
+     */
+    @JavascriptInterface
+    fun requestUninstall() {
+        val uninstall = Intent(Intent.ACTION_DELETE, Uri.fromParts("package", context.packageName, null))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        Handler(Looper.getMainLooper()).post {
+            try {
+                context.startActivity(uninstall)
+            } catch (e: Exception) {
+                Log.w("WebAppInterface", "ACTION_DELETE was refused; falling back to App info", e)
+                try {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", context.packageName, null)
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } catch (e2: Exception) {
+                    Log.e("WebAppInterface", "Could not open the uninstaller: ", e2)
+                }
+            }
+        }
+    }
+
+    // getLeaveState's answer with canSelfUninstall corrected for this host.
+    // Anything unparseable, or an error response, is passed through untouched:
+    // a leaving card that renders one degree too cautiously is a far better
+    // failure than one that throws while somebody is trying to leave.
+    private fun withNativeUninstall(response: String?): String {
+        if (response.isNullOrEmpty()) return response ?: ""
+        return try {
+            val json = JSONObject(response)
+            if (json.has("error")) response else json.put("canSelfUninstall", true).toString()
+        } catch (e: Exception) {
+            response
+        }
     }
 
     private fun openOptions(section: String? = null) {

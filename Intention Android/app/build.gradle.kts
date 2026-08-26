@@ -60,6 +60,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    testOptions {
+        // The pure decision functions under test (AppParts.verdict,
+        // LeavePolicy.allows, RemovalSurfaceMatcher) never call the framework,
+        // but the mockable android.jar still has to answer for the classes
+        // they are compiled against. Default values rather than a throw is the
+        // only thing that lets a plain JVM test run at all.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -73,4 +81,11 @@ dependencies {
     // Google Play Billing — Intention Pro, the subscription that powers the
     // built-in coach (BillingManager.kt).
     implementation("com.android.billingclient:billing-ktx:8.0.0")
+
+    // Local JVM tests for the pure halves of the blocking decisions — the
+    // ones a wrong answer in silently unblocks something. org.json is the real
+    // implementation, because the one inside the mockable android.jar is a set
+    // of stubs that throw.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20180813")
 }

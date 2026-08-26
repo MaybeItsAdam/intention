@@ -7,6 +7,22 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		5375E5AA0000000000007000 /* parts.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006000 /* parts.js */; };
+		5375E5AA0000000000007001 /* rules.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006001 /* rules.js */; };
+		5375E5AA0000000000007002 /* gate-ui.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006002 /* gate-ui.js */; };
+		5375E5AA0000000000007003 /* options-access.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006003 /* options-access.js */; };
+		5375E5AA0000000000007004 /* options-coach.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006004 /* options-coach.js */; };
+		5375E5AA0000000000007005 /* options-lists.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006005 /* options-lists.js */; };
+		5375E5AA0000000000007006 /* options-rows.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006006 /* options-rows.js */; };
+		5375E5AA0000000000007007 /* options-wizard.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006007 /* options-wizard.js */; };
+		5375E5AA0000000000008000 /* parts.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006000 /* parts.js */; };
+		5375E5AA0000000000008001 /* rules.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006001 /* rules.js */; };
+		5375E5AA0000000000008002 /* gate-ui.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006002 /* gate-ui.js */; };
+		5375E5AA0000000000008003 /* options-access.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006003 /* options-access.js */; };
+		5375E5AA0000000000008004 /* options-coach.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006004 /* options-coach.js */; };
+		5375E5AA0000000000008005 /* options-lists.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006005 /* options-lists.js */; };
+		5375E5AA0000000000008006 /* options-rows.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006006 /* options-rows.js */; };
+		5375E5AA0000000000008007 /* options-wizard.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006007 /* options-wizard.js */; };
 		BA10C0DE00000000000000B1 /* IntentionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA10C0DE000000000000FE01 /* IntentionStore.swift */; };
 		BA10C0DE00000000000000B2 /* IntentionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA10C0DE000000000000FE01 /* IntentionStore.swift */; };
 		BA10C0DE00000000000000C2 /* AppGroupConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C82B6114B5CE5FA7C5FCC52 /* AppGroupConfig.swift */; };
@@ -218,6 +234,14 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		5375E5AA0000000000006000 /* parts.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = parts.js; path = "../../Intention Chrome/parts.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006001 /* rules.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = rules.js; path = "../../Intention Chrome/rules.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006002 /* gate-ui.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = gate-ui.js; path = "../../Intention Chrome/gate-ui.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006003 /* options-access.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = options-access.js; path = "../../Intention Chrome/options-access.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006004 /* options-coach.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = options-coach.js; path = "../../Intention Chrome/options-coach.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006005 /* options-lists.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = options-lists.js; path = "../../Intention Chrome/options-lists.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006006 /* options-rows.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = options-rows.js; path = "../../Intention Chrome/options-rows.js"; sourceTree = "<group>"; };
+		5375E5AA0000000000006007 /* options-wizard.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = options-wizard.js; path = "../../Intention Chrome/options-wizard.js"; sourceTree = "<group>"; };
 		BA10C0DE000000000000FE01 /* IntentionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntentionStore.swift; sourceTree = "<group>"; };
 		BA10C0DE000000000000FE02 /* Intention.storekit */ = {isa = PBXFileReference; lastKnownFileType = text; path = Intention.storekit; sourceTree = "<group>"; };
 		1C82B6114B5CE5FA7C5FCC52 /* AppGroupConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupConfig.swift; sourceTree = "<group>"; };
@@ -482,6 +506,14 @@
 			children = (
 				66B8D06B2FE985EF00BC0D7F /* icon16.png */,
 				66B8D06C2FE985EF00BC0D7F /* prompts.js */,
+				5375E5AA0000000000006000 /* parts.js */,
+				5375E5AA0000000000006001 /* rules.js */,
+				5375E5AA0000000000006002 /* gate-ui.js */,
+				5375E5AA0000000000006003 /* options-access.js */,
+				5375E5AA0000000000006004 /* options-coach.js */,
+				5375E5AA0000000000006005 /* options-lists.js */,
+				5375E5AA0000000000006006 /* options-rows.js */,
+				5375E5AA0000000000006007 /* options-wizard.js */,
 				66B8D06C2FE985EF00BC0D7E /* page_context.js */,
 				66B8D06D2FE985EF00BC0D7F /* content.css */,
 				66B8D06E2FE985EF00BC0D7F /* background.js */,
@@ -839,6 +871,14 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5375E5AA0000000000007000 /* parts.js in Resources */,
+				5375E5AA0000000000007001 /* rules.js in Resources */,
+				5375E5AA0000000000007002 /* gate-ui.js in Resources */,
+				5375E5AA0000000000007003 /* options-access.js in Resources */,
+				5375E5AA0000000000007004 /* options-coach.js in Resources */,
+				5375E5AA0000000000007005 /* options-lists.js in Resources */,
+				5375E5AA0000000000007006 /* options-rows.js in Resources */,
+				5375E5AA0000000000007007 /* options-wizard.js in Resources */,
 				66B8D08A2FE985EF00BC0D7F /* background.js in Resources */,
 				66B8D0912FE985EF00BC0D7F /* content.js in Resources */,
 				5275E5AA0000000000005201 /* report.js in Resources */,
@@ -869,6 +909,14 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5375E5AA0000000000008000 /* parts.js in Resources */,
+				5375E5AA0000000000008001 /* rules.js in Resources */,
+				5375E5AA0000000000008002 /* gate-ui.js in Resources */,
+				5375E5AA0000000000008003 /* options-access.js in Resources */,
+				5375E5AA0000000000008004 /* options-coach.js in Resources */,
+				5375E5AA0000000000008005 /* options-lists.js in Resources */,
+				5375E5AA0000000000008006 /* options-rows.js in Resources */,
+				5375E5AA0000000000008007 /* options-wizard.js in Resources */,
 				66B8D07C2FE985EF00BC0D7F /* background.js in Resources */,
 				66B8D0832FE985EF00BC0D7F /* content.js in Resources */,
 				5275E5AA0000000000005202 /* report.js in Resources */,

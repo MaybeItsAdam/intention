@@ -27,7 +27,9 @@ const { handleRequest } = await import('../server/src/app.js');
 const { signToken, verifyToken, subjectFor } = await import('../server/src/tokens.js');
 const {
   MemoryStore, FileStore, adjustBalance, getBalanceMicros, alreadyCredited, markCredited, refundTopUp, getCreditRecord,
-  getTokenVersion, bumpTokenVersion
+  getTokenVersion, bumpTokenVersion,
+  hasBalanceRecord, generateRecoveryCode, lookupRecoveryCode, getRecoveryCode,
+  RECOVERY_CODE_TTL_MS, RECOVERY_BODY_LEN, RECOVERY_RESTAMP_INTERVAL_MS
 } = await import('../server/src/store.js');
 const { verifyAppleJWS, decodeJWS, verifyAppleReceipt, VerificationError } = await import('../server/src/apple.js');
 const { verifyGooglePurchase } = await import('../server/src/google.js');
@@ -354,6 +356,683 @@ describe('browser access codes', () => {
   });
 });
 
+// A consumable receipt is spent the moment it is verified, so after a
+// reinstall there is nothing left to re-verify and no live token to refresh.
+// These two routes are the entire answer to "I paid, and the app has
+// forgotten" — /recover for the case where the account id survived, the
+// recovery code for the case where nothing did.
+describe('POST /v1/entitlement/recover', () => {
+  const UUID = 'b6f0d0c2-1f4e-4a9a-9c3f-8d2b6a1e5c77';
+  const recover = (body, d, ip = '203.0.113.50') =>
+    handleRequest({ method: 'POST', path: '/v1/entitlement/recover', headers: {}, body, ip }, d);
+
+  it('mints a live token for an account that already has a balance', async () => {
+    const d = deps();
+    const sub = subjectFor('apple', UUID);
+    adjustBalance(sub, CREDIT1, d.store);
+
+    const res = await recover({ platform: 'apple', accountToken: UUID }, d);
+    expect(res.status).toBe(200);
+    expect(res.body.active).toBe(true);
+    expect(res.body.balanceMicros).toBe(CREDIT1);
+    expect(verifyToken(res.body.token, SECRET).sub).toBe(sub);
+  });
+
+  it('recovers an account spent down to exactly zero', async () => {
+    const d = deps();
+    const sub = subjectFor('google', UUID);
+    // A record with value 0, which is what spending the last credit leaves
+    // behind. Refusing it would send the next top-up into a second balance.
+    adjustBalance(sub, 0, d.store);
+
+    const res = await recover({ platform: 'google', accountToken: UUID }, d);
+    expect(res.status).toBe(200);
+    expect(res.body.active).toBe(false);
+    expect(res.body.balanceMicros).toBe(0);
+    expect(verifyToken(res.body.token, SECRET).sub).toBe(sub);
+  });
+
+  it('404s an account nobody has ever purchased under', async () => {
+    const d = deps();
+    const res = await recover({ platform: 'apple', accountToken: UUID }, d);
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('no_balance_for_account');
+  });
+
+  // The load-bearing property. A miss that created a zero balance would make
+  // every later guess of the same UUID succeed, and FileStore.set() fsyncs the
+  // whole ledger, so an unauthenticated writeable route is also write
+  // amplification.
+  it('writes nothing to the store on either the hit or the miss path', async () => {
+    const d = deps();
+    const known = subjectFor('apple', UUID);
+    adjustBalance(known, CREDIT1, d.store);
+
+    const beforeHit = d.store.size;
+    expect((await recover({ platform: 'apple', accountToken: UUID }, d)).status).toBe(200);
+    expect(d.store.size).toBe(beforeHit);
+
+    const unknown = 'c0ffee00-dead-4bee-8fed-0123456789ab';
+    const beforeMiss = d.store.size;
+    expect((await recover({ platform: 'apple', accountToken: unknown }, d)).status).toBe(404);
+    expect(d.store.size).toBe(beforeMiss);
+    expect(d.store.get(`balance:${subjectFor('apple', unknown)}`)).toBe(null);
+  });
+
+  it('rejects a malformed account token and an unknown platform with 400', async () => {
+    const d = deps();
+    expect((await recover({ platform: 'apple', accountToken: 'nope' }, d)).body.code).toBe('bad_request');
+    expect((await recover({ platform: 'apple', accountToken: 'has spaces in it' }, d)).body.code).toBe('bad_request');
+    expect((await recover({ platform: 'apple' }, d)).status).toBe(400);
+    expect((await recover({ platform: 'windows', accountToken: UUID }, d)).status).toBe(400);
+  });
+
+  // Swift renders a UUID uppercase and nothing normalises the case anywhere in
+  // the pipeline, so which case a balance got keyed under depends on which
+  // store echoed the token back first.
+  it('finds a balance keyed under a differently-cased account id', async () => {
+    const d = deps();
+    adjustBalance(subjectFor('apple', UUID.toLowerCase()), CREDIT1, d.store);
+    const res = await recover({ platform: 'apple', accountToken: UUID.toUpperCase() }, d);
+    expect(res.status).toBe(200);
+    expect(verifyToken(res.body.token, SECRET).sub).toBe(subjectFor('apple', UUID.toLowerCase()));
+  });
+
+  it('locks out an IP that keeps guessing account ids', async () => {
+    const d = deps();
+    for (let i = 0; i < 10; i++) {
+      const res = await recover({ platform: 'apple', accountToken: `00000000-0000-4000-8000-00000000000${i}` }, d, '198.51.100.20');
+      expect(res.status).toBe(404);
+    }
+    // Even the right id is refused once the miss budget is spent.
+    adjustBalance(subjectFor('apple', UUID), CREDIT1, d.store);
+    expect((await recover({ platform: 'apple', accountToken: UUID }, d, '198.51.100.20')).status).toBe(429);
+    // A different address is unaffected.
+    expect((await recover({ platform: 'apple', accountToken: UUID }, d, '198.51.100.21')).status).toBe(200);
+  });
+
+  it('a successful recovery does not consume the miss budget', async () => {
+    const d = deps();
+    adjustBalance(subjectFor('apple', UUID), CREDIT1, d.store);
+    for (let i = 0; i < 12; i++) {
+      expect((await recover({ platform: 'apple', accountToken: UUID }, d, '198.51.100.22')).status).toBe(200);
+    }
+  });
+});
+
+describe('recovery codes', () => {
+  // store.js's CODE_ALPHABET, restated: no I/O/0/1, because this one gets
+  // written on paper and read back by a human.
+  const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const mint = async (d) => {
+    const verified = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    return { token: verified.body.token, auth: { authorization: `Bearer ${verified.body.token}` } };
+  };
+
+  it('needs a bearer token', async () => {
+    expect((await post('/v1/entitlement/recovery-code', null, {})).status).toBe(401);
+  });
+
+  it('rejects a revoked token', async () => {
+    const d = deps();
+    const { token, auth } = await mint(d);
+    bumpTokenVersion(verifyToken(token, SECRET).sub, d.store);
+    expect((await post('/v1/entitlement/recovery-code', null, auth, d)).status).toBe(401);
+  });
+
+  it('is 16 characters drawn only from the code alphabet', async () => {
+    const d = deps();
+    const { auth } = await mint(d);
+    const res = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(res.status).toBe(200);
+    const body = res.body.code.replace(/^INT-/, '').split('-').join('');
+    expect(body).toHaveLength(RECOVERY_BODY_LEN);
+    expect([...body].every((c) => ALPHABET.includes(c))).toBe(true);
+  });
+
+  // Re-opening Settings must show the code already on the user's paper, not
+  // issue a second key to the same balance.
+  it('is idempotent', async () => {
+    const d = deps();
+    const { auth } = await mint(d);
+    const first = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const second = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(second.body.code).toBe(first.body.code);
+    expect(second.body.createdAt).toBe(first.body.createdAt);
+  });
+
+  it('rotate mints a new code and kills the old one', async () => {
+    const d = deps();
+    const { auth } = await mint(d);
+    const first = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const rotated = await post('/v1/entitlement/recovery-code', { rotate: true }, auth, d);
+    expect(rotated.body.code).not.toBe(first.body.code);
+
+    expect((await post('/v1/entitlement/redeem', { code: first.body.code }, {}, d)).status).toBe(404);
+    expect((await post('/v1/entitlement/redeem', { code: rotated.body.code }, {}, d)).status).toBe(200);
+  });
+
+  // The whole difference from the 15-minute link code, in one test.
+  it('redeems more than once, where a browser access code does not', async () => {
+    const d = deps();
+    const { token, auth } = await mint(d);
+    const sub = verifyToken(token, SECRET).sub;
+
+    const recovery = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const first = await post('/v1/entitlement/redeem', { code: recovery.body.code }, {}, d);
+    const second = await post('/v1/entitlement/redeem', { code: recovery.body.code }, {}, d);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(verifyToken(second.body.token, SECRET).sub).toBe(sub);
+    expect(second.body.balanceMicros).toBe(CREDIT1);
+
+    const access = await post('/v1/entitlement/code', null, auth, d);
+    expect((await post('/v1/entitlement/redeem', { code: access.body.code }, {}, d)).status).toBe(200);
+    expect((await post('/v1/entitlement/redeem', { code: access.body.code }, {}, d)).status).toBe(404);
+  });
+
+  it('accepts a lower-cased code, the way the access code does', async () => {
+    const d = deps();
+    const { auth } = await mint(d);
+    const issued = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const res = await post('/v1/entitlement/redeem', { code: `  ${issued.body.code.toLowerCase()}  ` }, {}, d);
+    expect(res.status).toBe(200);
+  });
+
+  // The throttle is charged to minting, never to the read. Opening Settings
+  // an eleventh time in an hour used to answer 429 and no recovery code, on
+  // the one screen whose entire job is to show one.
+  it('throttles minting and rotation, but never the idempotent read', async () => {
+    const d = deps();
+    const { auth } = await mint(d);
+    const first = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(first.status).toBe(200);
+
+    let last;
+    for (let i = 0; i < 20; i++) {
+      last = await post('/v1/entitlement/recovery-code', null, auth, d);
+    }
+    expect(last.status).toBe(200);
+    expect(last.body.code).toBe(first.body.code);
+
+    // Those reads bought no headroom either: rotation still has its own full
+    // budget, and still runs out.
+    let rotated;
+    for (let i = 0; i < 9; i++) {
+      rotated = await post('/v1/entitlement/recovery-code', { rotate: true }, auth, d);
+      expect(rotated.status).toBe(200);
+    }
+    expect((await post('/v1/entitlement/recovery-code', { rotate: true }, auth, d)).status).toBe(429);
+    // ...and the code the user already has is still readable while minting is
+    // throttled, because reading is not minting.
+    const read = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(read.status).toBe(200);
+    expect(read.body.code).toBe(rotated.body.code);
+  });
+
+  // DEFECT 4, second half. FileStore.set() serialises and fsyncs the entire
+  // ledger, and store.js's own note promises the durable store "only ever
+  // sees rare writes". Two whole-ledger fsyncs per Settings open, and two
+  // more per unauthenticated redeem attempt (30/hour/IP), is not that.
+  it('does not write to the durable store on either read path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'intention-recovery-'));
+    const backing = new FileStore(join(dir, 'state.json'));
+    let writes = 0;
+    const realPersist = backing.persist.bind(backing);
+    backing.persist = () => { writes += 1; return realPersist(); };
+
+    const d = deps({ store: backing });
+    const { auth } = await mint(d);
+    const issued = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(issued.status).toBe(200);
+
+    writes = 0;
+    const read = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(read.body.code).toBe(issued.body.code);
+    expect(writes).toBe(0);
+
+    writes = 0;
+    expect((await post('/v1/entitlement/redeem', { code: issued.body.code }, {}, d)).status).toBe(200);
+    expect(writes).toBe(0);
+  });
+
+  it('pushes the expiry back out on a stale lookup rather than deleting', () => {
+    const backing = new MemoryStore();
+    const { code } = generateRecoveryCode({ sub: 's', platform: 'apple', productId: 'p' }, { backing });
+    // Age it past the re-stamp interval, stamp and TTL together — a code
+    // minted a year ago and used today must not then lapse.
+    const record = backing.map.get(`recovery:${code}`);
+    record.value = { ...record.value, stampedAt: Date.now() - RECOVERY_RESTAMP_INTERVAL_MS - 1000 };
+    record.expiresAt = Date.now() + 1000;
+    backing.map.get('recoveryOf:s').expiresAt = Date.now() + 1000;
+
+    expect(lookupRecoveryCode(code, backing).sub).toBe('s');
+    expect(backing.map.get(`recovery:${code}`).expiresAt).toBeGreaterThan(Date.now() + RECOVERY_CODE_TTL_MS - 5000);
+    // The owner mapping moves with it, or Settings would mint a second code
+    // while the user's paper one is still live.
+    expect(backing.map.get('recoveryOf:s').expiresAt).toBeGreaterThan(Date.now() + RECOVERY_CODE_TTL_MS - 5000);
+    expect(getRecoveryCode('s', backing)).toBe(code);
+  });
+
+  // ...and the other side of that: a lookup inside the interval touches
+  // nothing at all, and still reports the expiry the records really carry.
+  it('leaves a freshly stamped code untouched on lookup', () => {
+    const backing = new MemoryStore();
+    const { code, expiresAt } = generateRecoveryCode({ sub: 's', platform: 'apple', productId: 'p' }, { backing });
+    const before = backing.map.get(`recovery:${code}`).expiresAt;
+
+    const sets = [];
+    const realSet = backing.set.bind(backing);
+    backing.set = (k, v, ttl) => { sets.push(k); return realSet(k, v, ttl); };
+
+    expect(lookupRecoveryCode(code, backing).sub).toBe('s');
+    expect(sets).toEqual([]);
+    expect(backing.map.get(`recovery:${code}`).expiresAt).toBe(before);
+    // The reported expiry follows the stamp, not the moment of the read.
+    expect(Math.abs(expiresAt - before)).toBeLessThan(5000);
+  });
+
+  // A record written before stampedAt existed carries only createdAt. It must
+  // still be re-stamped once it goes stale, rather than being treated as
+  // freshly stamped for ever and quietly lapsing at 400 days.
+  it('upgrades a pre-stampedAt record on its first stale lookup', () => {
+    const backing = new MemoryStore();
+    const { code } = generateRecoveryCode({ sub: 's', platform: 'apple', productId: 'p' }, { backing });
+    const entry = backing.map.get(`recovery:${code}`);
+    const legacy = { ...entry.value };
+    delete legacy.stampedAt;
+    entry.value = { ...legacy, createdAt: Date.now() - RECOVERY_RESTAMP_INTERVAL_MS - 1000 };
+    entry.expiresAt = Date.now() + 1000;
+
+    expect(lookupRecoveryCode(code, backing).sub).toBe('s');
+    expect(backing.map.get(`recovery:${code}`).value.stampedAt).toBeGreaterThan(Date.now() - 5000);
+    expect(backing.map.get(`recovery:${code}`).expiresAt).toBeGreaterThan(Date.now() + RECOVERY_CODE_TTL_MS - 5000);
+  });
+
+  it('returns null for an unknown code', () => {
+    expect(lookupRecoveryCode('INT-ZZZZ-ZZZZ-ZZZZ-ZZZZ', new MemoryStore())).toBe(null);
+    expect(lookupRecoveryCode('', new MemoryStore())).toBe(null);
+  });
+});
+
+// DEFECT 3. A bearer alone used to be enough to mint one of these, and a
+// bearer is exactly what /v1/entitlement/redeem hands to whoever types a
+// browser access code — whose whole documented guarantee (store.js) is that
+// it is single use, "so a code shared or intercepted after the fact is
+// already spent". That session could mint a permanent, multi-use credential
+// out of a spent fifteen-minute one, and with { rotate: true } silently 404
+// the code the owner had written on paper.
+describe('minting a recovery code needs more than a redeemed code', () => {
+  const storeSession = async (d) => {
+    const verified = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    return { authorization: `Bearer ${verified.body.token}` };
+  };
+
+  it('refuses a session that came from a browser access code', async () => {
+    const d = deps();
+    const owner = await storeSession(d);
+    const paper = await post('/v1/entitlement/recovery-code', null, owner, d);
+    expect(paper.status).toBe(200);
+
+    const link = await post('/v1/entitlement/code', null, owner, d);
+    const redeemed = await post('/v1/entitlement/redeem', { code: link.body.code }, {}, d);
+    expect(redeemed.status).toBe(200);
+    const bystander = { authorization: `Bearer ${redeemed.body.token}` };
+    // The session is real, and really is the owner's — it can spend that
+    // balance, which is what the link code is for. What it cannot do is
+    // escalate itself into a permanent one.
+    expect(verifyToken(redeemed.body.token, SECRET).sub).toBe(subjectFor('apple', 'acct-apple-1'));
+    expect(redeemed.body.balanceMicros).toBe(CREDIT1);
+
+    const minted = await post('/v1/entitlement/recovery-code', null, bystander, d);
+    expect(minted.status).toBe(403);
+    expect(minted.body.code).toBe('store_session_required');
+    expect(minted.body.code).not.toMatch(/^INT-/);
+
+    const rotated = await post('/v1/entitlement/recovery-code', { rotate: true }, bystander, d);
+    expect(rotated.status).toBe(403);
+    // The owner's written-down code is untouched.
+    expect((await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d)).status).toBe(200);
+  });
+
+  it('refuses a session that came from /v1/entitlement/recover', async () => {
+    const d = deps();
+    const UUID = 'b6f0d0c2-1f4e-4a9a-9c3f-8d2b6a1e5c77';
+    adjustBalance(subjectFor('apple', UUID), CREDIT1, d.store);
+    const recovered = await handleRequest({
+      method: 'POST', path: '/v1/entitlement/recover', headers: {}, ip: '203.0.113.60',
+      body: { platform: 'apple', accountToken: UUID }
+    }, d);
+    expect(recovered.status).toBe(200);
+
+    const res = await post('/v1/entitlement/recovery-code', null,
+      { authorization: `Bearer ${recovered.body.token}` }, d);
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('store_session_required');
+  });
+
+  // A session that redeemed a recovery code already holds the strongest
+  // artefact there is, so showing it again — or rotating it because the paper
+  // leaked — escalates nothing.
+  it('allows a session that redeemed the recovery code itself', async () => {
+    const d = deps();
+    const owner = await storeSession(d);
+    const paper = await post('/v1/entitlement/recovery-code', null, owner, d);
+    const redeemed = await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d);
+    const auth = { authorization: `Bearer ${redeemed.body.token}` };
+
+    const read = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect(read.status).toBe(200);
+    expect(read.body.code).toBe(paper.body.code);
+    expect((await post('/v1/entitlement/recovery-code', { rotate: true }, auth, d)).status).toBe(200);
+  });
+
+  // Fail closed on a token minted before the claim existed. A paying device
+  // re-verifies its store receipt on launch and is upgraded within one run;
+  // a browser that redeemed a code never is, which is the intent.
+  it('refuses a token from before the claim existed', async () => {
+    const d = deps();
+    const sub = subjectFor('apple', 'acct-apple-1');
+    const legacy = { authorization: `Bearer ${signToken({ sub, platform: 'apple', productId: 'p' }, SECRET, 60_000)}` };
+    const res = await post('/v1/entitlement/recovery-code', null, legacy, d);
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('store_session_required');
+  });
+
+  // A refresh proves the token is still live, not that the session behind it
+  // got any stronger — and not that it got any weaker either.
+  it('carries the session kind across a refresh, in both directions', async () => {
+    const d = deps();
+    const owner = await storeSession(d);
+    const ownerToken = owner.authorization.slice('Bearer '.length);
+    const refreshed = await post('/v1/entitlement/refresh', { token: ownerToken }, {}, d);
+    expect((await post('/v1/entitlement/recovery-code', null,
+      { authorization: `Bearer ${refreshed.body.token}` }, d)).status).toBe(200);
+
+    const link = await post('/v1/entitlement/code', null, owner, d);
+    const redeemed = await post('/v1/entitlement/redeem', { code: link.body.code }, {}, d);
+    const relinked = await post('/v1/entitlement/refresh', { token: redeemed.body.token }, {}, d);
+    expect(relinked.status).toBe(200);
+    expect((await post('/v1/entitlement/recovery-code', null,
+      { authorization: `Bearer ${relinked.body.token}` }, d)).status).toBe(403);
+  });
+});
+
+// The claim is sealed in the token, which is where the *server* reads it. It is
+// also echoed in the response body, which is where the CLIENT reads it — and it
+// has to, because it decides whether to offer an action only some sessions may
+// take. Without it a browser that redeemed a link code was shown a "Recovery
+// code" button that fetched on sight and could only ever come back 403, printed
+// as "try again in a moment", for ever. Echoing it discloses nothing: it is a
+// claim in the token the caller is already holding.
+describe('the response says which kind of session it just minted', () => {
+  const srcOf = (body) => {
+    expect(verifyToken(body.token, SECRET).src).toBe(body.src);
+    return body.src;
+  };
+
+  it('names every mint site, and carries it across a refresh', async () => {
+    const d = deps();
+    const verified = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    expect(srcOf(verified.body)).toBe('store');
+    const auth = { authorization: `Bearer ${verified.body.token}` };
+
+    const link = await post('/v1/entitlement/code', null, auth, d);
+    const linked = await post('/v1/entitlement/redeem', { code: link.body.code }, {}, d);
+    expect(srcOf(linked.body)).toBe('link');
+
+    const paper = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const redeemed = await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d);
+    expect(srcOf(redeemed.body)).toBe('paper');
+
+    const recovered = await handleRequest({
+      method: 'POST', path: '/v1/entitlement/recover', headers: {}, ip: '203.0.113.77',
+      body: { platform: 'apple', accountToken: 'acct-apple-1' }
+    }, d);
+    expect(srcOf(recovered.body)).toBe('account');
+
+    // A refresh proves the token is still live, not that the session got any
+    // stronger — in the body as well as in the token.
+    const refreshedStore = await post('/v1/entitlement/refresh', { token: verified.body.token }, {}, d);
+    expect(srcOf(refreshedStore.body)).toBe('store');
+    const refreshedLink = await post('/v1/entitlement/refresh', { token: linked.body.token }, {}, d);
+    expect(srcOf(refreshedLink.body)).toBe('link');
+  });
+
+  // The client's way out of the 403 that every device paying before this
+  // release would otherwise be stuck behind for a year: nothing re-verifies a
+  // consumable by itself, so billing.js re-posts the STORED receipt on the
+  // refusal and retries once. This is that sequence, server-side.
+  it('upgrades a session minted before the claim existed, from the stored receipt', async () => {
+    const d = deps();
+    const sub = subjectFor('apple', 'acct-apple-1');
+    await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    const legacy = signToken({ sub, platform: 'apple', productId: appleResult.productId }, SECRET, 60_000);
+
+    const refused = await post('/v1/entitlement/recovery-code', null, { authorization: `Bearer ${legacy}` }, d);
+    expect(refused.status).toBe(403);
+    expect(refused.body.code).toBe('store_session_required');
+
+    // Same receipt, same subject, no double credit — and a token that now says
+    // how it proved itself.
+    const reverified = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    expect(srcOf(reverified.body)).toBe('store');
+    expect(reverified.body.balanceMicros).toBe(CREDIT1);
+
+    const minted = await post('/v1/entitlement/recovery-code', null,
+      { authorization: `Bearer ${reverified.body.token}` }, d);
+    expect(minted.status).toBe(200);
+    expect(minted.body.code).toMatch(/^INT-/);
+  });
+});
+
+// The rider on the same endpoint. Redemption goes through entitlementResponse,
+// which re-reads the *current* token version to stamp the token it issues —
+// so a code, which outlives every token minted from it, answered to nothing.
+// No production caller of bumpTokenVersion exists yet, which is exactly why
+// this had to be fixed before one does.
+describe('a redeemed code answers to bumpTokenVersion', () => {
+  const storeSession = async (d) => {
+    const verified = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    return { token: verified.body.token, auth: { authorization: `Bearer ${verified.body.token}` } };
+  };
+
+  it('kills a recovery code minted before the bump', async () => {
+    const d = deps();
+    const { token, auth } = await storeSession(d);
+    const sub = verifyToken(token, SECRET).sub;
+    const paper = await post('/v1/entitlement/recovery-code', null, auth, d);
+    expect((await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d)).status).toBe(200);
+
+    bumpTokenVersion(sub, d.store);
+
+    const after = await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d);
+    expect(after.status).toBe(404);
+    expect(after.body.token).toBeUndefined();
+    // Indistinguishable from a code that never existed: which of "no such
+    // code", "already spent" and "revoked" it was is not a guesser's to learn.
+    const missing = await post('/v1/entitlement/redeem', { code: 'INT-ZZZZ-ZZZZ-ZZZZ-ZZZZ' }, {}, d);
+    expect(missing.body).toEqual(after.body);
+  });
+
+  it('kills an outstanding browser access code too', async () => {
+    const d = deps();
+    const { token, auth } = await storeSession(d);
+    const link = await post('/v1/entitlement/code', null, auth, d);
+    bumpTokenVersion(verifyToken(token, SECRET).sub, d.store);
+    expect((await post('/v1/entitlement/redeem', { code: link.body.code }, {}, d)).status).toBe(404);
+  });
+
+  // A revoked redemption is a miss, and is charged as one.
+  it('charges a revoked redemption against the miss budget', async () => {
+    const d = deps();
+    const { token, auth } = await storeSession(d);
+    const paper = await post('/v1/entitlement/recovery-code', null, auth, d);
+    bumpTokenVersion(verifyToken(token, SECRET).sub, d.store);
+    for (let i = 0; i < 10; i++) {
+      expect((await handleRequest({ method: 'POST', path: '/v1/entitlement/redeem', headers: {},
+        body: { code: paper.body.code }, ip: '198.51.100.40' }, d)).status).toBe(404);
+    }
+    expect((await handleRequest({ method: 'POST', path: '/v1/entitlement/redeem', headers: {},
+      body: { code: paper.body.code }, ip: '198.51.100.40' }, d)).status).toBe(429);
+  });
+
+  // Nothing changes for a subject nobody ever revoked, including one whose
+  // code predates the tv field entirely.
+  it('leaves an unrevoked subject, and a pre-tv code record, alone', async () => {
+    const d = deps();
+    const { auth } = await storeSession(d);
+    const paper = await post('/v1/entitlement/recovery-code', null, auth, d);
+    const entry = d.store.map.get(`recovery:${paper.body.code}`);
+    const legacy = { ...entry.value };
+    delete legacy.tv;
+    entry.value = legacy;
+    expect((await post('/v1/entitlement/redeem', { code: paper.body.code }, {}, d)).status).toBe(200);
+  });
+});
+
+// USER DECISION D3. Without it a device that recovered by code holds a token
+// for one subject while its fresh local UUID attests as another, so its next
+// top-up credits a balance the user can never see.
+describe('a live bearer overrides the store-attested account on verify', () => {
+  const bearerFor = (sub, platform = 'apple') =>
+    ({ authorization: `Bearer ${signToken({ sub, platform, productId: 'p' }, SECRET, 60_000)}` });
+
+  it('credits the bearer subject instead of the attested one', async () => {
+    const d = deps();
+    const attested = subjectFor('apple', 'acct-apple-1');
+    const res = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, bearerFor('recovered-sub'), d);
+    expect(res.status).toBe(200);
+    expect(verifyToken(res.body.token, SECRET).sub).toBe('recovered-sub');
+    expect(getBalanceMicros('recovered-sub', d.store)).toBe(CREDIT1);
+    expect(getBalanceMicros(attested, d.store)).toBe(0);
+  });
+
+  // The clawback has to follow the money, not the receipt — and it has to do
+  // so through the webhook, which is the only caller that exists. Driving
+  // refundTopUp directly with {} proves nothing about it: the webhook passes
+  // a subject computed from the token Apple echoes back, and refundTopUp
+  // prefers an explicitly-passed subject over the credit record's own, so the
+  // one path that matters was the one path this test did not take.
+  it('claws back from the bearer subject even though the notification names the device', async () => {
+    const d = deps();
+    await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, bearerFor('recovered-sub'), d);
+    expect(getCreditRecord('apple', 'txn-1', d.store).subject).toBe('recovered-sub');
+    const attested = subjectFor('apple', 'acct-apple-1');
+
+    // Exactly what Apple sends: the transaction's own appAccountToken, which
+    // is the device's freshly minted UUID, not the recovered account.
+    const signedPayload = fakeJWS({
+      notificationType: 'REFUND',
+      data: {
+        signedTransactionInfo: fakeJWS({
+          bundleId: 'uk.co.maybeitssoftware.intention',
+          transactionId: 'txn-1',
+          appAccountToken: 'acct-apple-1',
+          productId: appleResult.productId
+        })
+      }
+    });
+    const res = await post('/v1/webhooks/apple', { signedPayload }, {}, d);
+    expect(res.status).toBe(200);
+    expect(res.body.refund.subject).toBe('recovered-sub');
+    expect(res.body.refund.deductedMicros).toBe(CREDIT1);
+
+    // The refunded user does not keep the credit...
+    expect(getBalanceMicros('recovered-sub', d.store)).toBe(0);
+    // ...and no phantom negative balance is invented under the device's own
+    // subject, which nobody ever bought anything under.
+    expect(getBalanceMicros(attested, d.store)).toBe(0);
+    expect(hasBalanceRecord(attested, d.store)).toBe(false);
+  });
+
+  // The consequence of getting the above wrong, pinned separately because it
+  // is what makes it severe rather than untidy: a negative balance is a
+  // *record*, hasBalanceRecord is presence-not-value, and /recover hands a
+  // live token to anyone holding that UUID — whose next top-up would then
+  // silently pay off a stranger's refund.
+  it('leaves nothing for a stranger to recover after that clawback', async () => {
+    const d = deps();
+    await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, bearerFor('recovered-sub'), d);
+    const signedPayload = fakeJWS({
+      notificationType: 'REFUND',
+      data: {
+        signedTransactionInfo: fakeJWS({
+          bundleId: 'uk.co.maybeitssoftware.intention',
+          transactionId: 'txn-1',
+          appAccountToken: 'acct-apple-1',
+          productId: appleResult.productId
+        })
+      }
+    });
+    await post('/v1/webhooks/apple', { signedPayload }, {}, d);
+
+    const res = await handleRequest({
+      method: 'POST', path: '/v1/entitlement/recover', headers: {}, ip: '203.0.113.77',
+      body: { platform: 'apple', accountToken: 'acct-apple-1' }
+    }, d);
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('no_balance_for_account');
+  });
+
+  // DEFECT 2. The override only works while the client holds a live bearer,
+  // and the path it exists for is exactly the one where it does not: tokens
+  // age out at tokenMaxLifetimeMs, billing.js's refreshEntitlement then falls
+  // back to re-verifying the stored receipt, and postBackend sends no
+  // Authorization header on that call. Without the server resolving the
+  // subject from the credit record, every recovered user eventually lands
+  // back on their device-attested subject at a zero balance.
+  it('still answers for the credited subject when the bearer is gone', async () => {
+    const d = deps();
+    const attested = subjectFor('apple', 'acct-apple-1');
+    await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, bearerFor('recovered-sub'), d);
+
+    const again = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    expect(again.status).toBe(200);
+    expect(verifyToken(again.body.token, SECRET).sub).toBe('recovered-sub');
+    expect(again.body.balanceMicros).toBe(CREDIT1);
+    expect(again.body.active).toBe(true);
+    // ...and it re-granted nothing on the way past.
+    expect(getBalanceMicros('recovered-sub', d.store)).toBe(CREDIT1);
+    expect(getBalanceMicros(attested, d.store)).toBe(0);
+  });
+
+  // The ordinary case is unchanged: a receipt whose credit was never
+  // redirected still resolves to the account the store attested.
+  it('leaves an ordinary repeat verify on the store-attested subject', async () => {
+    const d = deps();
+    const attested = subjectFor('apple', 'acct-apple-1');
+    await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    const again = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, {}, d);
+    expect(verifyToken(again.body.token, SECRET).sub).toBe(attested);
+    expect(again.body.balanceMicros).toBe(CREDIT1);
+  });
+
+  it('ignores a bearer for the other platform', async () => {
+    const d = deps();
+    const res = await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' }, bearerFor('other-sub', 'google'), d);
+    expect(verifyToken(res.body.token, SECRET).sub).toBe(subjectFor('apple', 'acct-apple-1'));
+  });
+
+  it('ignores a forged, expired or revoked bearer rather than failing the purchase', async () => {
+    const attested = subjectFor('apple', 'acct-apple-1');
+
+    const forged = deps();
+    expect(verifyToken((await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' },
+      { authorization: 'Bearer v1.aaa.bbb' }, forged)).body.token, SECRET).sub).toBe(attested);
+
+    const expired = deps();
+    const stale = { authorization: `Bearer ${signToken({ sub: 'x', platform: 'apple', exp: Date.now() - 1000 }, SECRET)}` };
+    expect(verifyToken((await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' },
+      stale, expired)).body.token, SECRET).sub).toBe(attested);
+
+    const revoked = deps();
+    bumpTokenVersion('revoked-sub', revoked.store);
+    expect(verifyToken((await post('/v1/entitlement/verify', { platform: 'apple', receipt: 'jws' },
+      bearerFor('revoked-sub'), revoked)).body.token, SECRET).sub).toBe(attested);
+  });
+});
+
 describe('POST /v1/chat', () => {
   let token, store, sub;
   beforeEach(() => {
@@ -461,6 +1140,16 @@ describe('balance ledger', () => {
     const backing = new MemoryStore();
     adjustBalance('sub', 100, backing);
     expect(backing.map.get('balance:sub').expiresAt).toBe(0);
+  });
+
+  // Presence, not value: the gate on /v1/entitlement/recover.
+  it('hasBalanceRecord is true for a subject spent to exactly 0 and false for one never seen', () => {
+    const backing = new MemoryStore();
+    adjustBalance('spent', 1000, backing);
+    adjustBalance('spent', -1000, backing);
+    expect(getBalanceMicros('spent', backing)).toBe(0);
+    expect(hasBalanceRecord('spent', backing)).toBe(true);
+    expect(hasBalanceRecord('never-seen', backing)).toBe(false);
   });
 
   it('the idempotency guard blocks a second credit for the same purchase id', () => {

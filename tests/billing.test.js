@@ -5,8 +5,8 @@
 // an entitlement moves between the store, the backend, and local storage. Those
 // are the parts App Store review outcomes depend on.
 
-import { describe, it, expect } from 'vitest';
-import { loadBilling, makeMockFetch } from './load.js';
+import { describe, it, expect, vi } from 'vitest';
+import { loadBilling, loadSource, makeMockFetch } from './load.js';
 
 const SAFARI_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const CHROME_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -337,7 +337,11 @@ describe('access codes', () => {
     const { ctx } = loadBilling({ fetch });
     const entitlement = await ctx.redeemAccessCode('  int-abcd-efgh ');
     expect(fetch.calls[0].url).toMatch(/\/v1\/entitlement\/redeem$/);
-    expect(JSON.parse(fetch.calls[0].init.body).code).toBe('int-abcd-efgh');
+    // Trimmed AND upper-cased. This assertion used to pin the verbatim
+    // lower-case string; the box now takes a written-down recovery code as
+    // well as a link code, and both alphabets are upper-case only. See "upper-
+    // cases a code typed in lower case" below for the reasoning.
+    expect(JSON.parse(fetch.calls[0].init.body).code).toBe('INT-ABCD-EFGH');
     expect(entitlement.source).toBe('code');
   });
 
@@ -372,5 +376,1068 @@ describe('store bridge', () => {
     const { ctx } = loadBilling({ userAgent: CHROME_UA });
     expect(await ctx.fetchStoreProducts()).toEqual({ available: false });
     expect(await ctx.purchaseProduct('p')).toEqual({ available: false });
+  });
+
+  // The failure mode a callback API makes easy: a bridge that is present,
+  // answers the method check, and then never calls back. There is no error to
+  // catch and no rejection to await — the promise simply never settles, and
+  // whatever awaited it never runs. That is how one unguarded
+  // `await storeAccountRestored()` on the paywall's render path could leave the
+  // AI-access card permanently empty with nothing logged.
+  //
+  // A missed deadline resolves to the same { available: false } shape "no
+  // bridge" already resolves to, so nothing downstream needs a second path.
+  it('gives up on a bridge that never calls back, rather than hanging for ever', async () => {
+    vi.useFakeTimers();
+    try {
+      const silent = { intentionBilling: { accountToken: () => {}, products: () => {}, status: () => {} } };
+      const { ctx } = loadBilling({ window: silent, userAgent: ANDROID_UA });
+      const restored = ctx.storeAccountRestored();
+      const products = ctx.fetchStoreProducts();
+      let settled = false;
+      restored.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(ctx.BRIDGE_QUERY_TIMEOUT_MS);
+      // undefined is "this build cannot tell", which every caller treats as
+      // "say nothing" — the right answer for a bridge that said nothing.
+      expect(await restored).toBe(undefined);
+      expect(await products).toEqual({ available: false, error: 'The store did not respond.' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ...and the deadline must not be able to cut off a purchase, which is
+  // waiting on a human in the store's own sheet and may take minutes.
+  it('puts no deadline on a purchase or a redemption', async () => {
+    vi.useFakeTimers();
+    try {
+      let finish;
+      const slow = {
+        intentionBilling: {
+          purchase: (id, cb) => { finish = () => cb({ status: 'purchased', receipt: 'jws' }); },
+          redeem: (cb) => { finish = () => cb({ status: 'purchased', receipt: 'jws' }); }
+        }
+      };
+      const { ctx } = loadBilling({ window: slow, userAgent: ANDROID_UA });
+      const pending = ctx.purchaseProduct('p');
+      let settled = false;
+      pending.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(ctx.BRIDGE_QUERY_TIMEOUT_MS * 4);
+      expect(settled).toBe(false);
+      finish();
+      expect((await pending).status).toBe('purchased');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The bridge is native code we do not control, so a late second callback
+  // after the deadline must not resurrect anything.
+  it('latches its answer, so a late callback changes nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      let late;
+      const win = { intentionBilling: { accountToken: (cb) => { late = cb; } } };
+      const { ctx } = loadBilling({ window: win, userAgent: ANDROID_UA });
+      const pending = ctx.storeAccountToken();
+      await vi.advanceTimersByTimeAsync(ctx.BRIDGE_QUERY_TIMEOUT_MS + 1);
+      late({ token: 'too-late' });
+      expect(await pending).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Getting a balance back after a reinstall
+// ---------------------------------------------------------------------------
+//
+// A top-up is a consumable: its receipt is consumed at purchase, Play stops
+// returning it and Apple's currentEntitlements excludes it by design. So after
+// a reinstall the ONLY thing left is the account id the platform put back, and
+// these are the rules for spending it.
+
+// Every call below names a `route`, and that is not incidental: the guard used
+// to be on the BUILD, which is a different question — BILLING_MODE is 'store'
+// on Android whether the coach is running on our credit or on a key the user
+// pasted. attemptSilentRecovery now asks nothing unless the resolved route says
+// there is a balance of ours to look for, and a caller that names no route asks
+// nothing at all. 'locked' is the ordinary first-run case (no credit yet) and
+// 'hosted' is the one refreshEntitlement reaches with a token that has died.
+describe('silent recovery', () => {
+  const storeBridge = (token = 'acct-uuid') => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token });
+    return b;
+  };
+
+  // The single most important property in this file after the 3.1.1 guard. A
+  // browser has no bridge and therefore no account id, and the server cannot
+  // tell a browser from anything else — so if the guard is not here, every
+  // Chrome install quietly posts an empty recovery request on first run.
+  it('makes no network call at all on a browser build', async () => {
+    const { ctx, fetch } = loadBilling({ userAgent: CHROME_UA });
+    expect(await ctx.attemptSilentRecovery('https://api.test', { route: 'locked' })).toBe(null);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  it('asks with the surviving account id on an Apple store build', async () => {
+    const fetch = makeMockFetch({ active: true, balanceCredits: 1240, token: 't' });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    const recovered = await ctx.attemptSilentRecovery('https://api.test', { route: 'locked' });
+    expect(fetch.calls[0].url).toBe('https://api.test/v1/entitlement/recover');
+    expect(JSON.parse(fetch.calls[0].init.body)).toEqual({ platform: 'apple', accountToken: 'acct-uuid' });
+    expect(recovered.balanceCredits).toBe(1240);
+    expect(recovered.source).toBe('apple');
+  });
+
+  it('names the Play platform on Android', async () => {
+    const fetch = makeMockFetch({ active: true, token: 't' });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: ANDROID_UA, fetch });
+    await ctx.attemptSilentRecovery('https://api.test', { route: 'locked' });
+    expect(JSON.parse(fetch.calls[0].init.body).platform).toBe('google');
+  });
+
+  // The overwhelmingly common caller is a brand-new user who has never bought
+  // anything. Telling them their credit could not be recovered would be both
+  // alarming and false, so a 404 has to be silence.
+  it('swallows "no balance for this account" into a quiet null', async () => {
+    const fetch = makeMockFetch({ status: 404, json: { code: 'no_balance_for_account', error: 'none' } });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    expect(await ctx.attemptSilentRecovery('https://api.test', { route: 'locked' })).toBe(null);
+  });
+
+  // ...but an outage means "unknown", and swallowing it would turn a server
+  // having a bad minute into "your credit is gone".
+  it('rethrows a real server error rather than reporting no credit', async () => {
+    const fetch = makeMockFetch({ status: 500, json: { code: 'server_error', error: 'boom' } });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    await expect(ctx.attemptSilentRecovery('https://api.test', { route: 'locked' })).rejects.toThrow('boom');
+  });
+
+  // The privacy half of the same guard, and the reason it is on the route and
+  // not the build. BILLING_MODE is 'store' on Android, and Android also offers
+  // a custom key — so a user who pasted their own Anthropic key, never bought
+  // anything, and was told in PRIVACY.md that nothing about their coaching
+  // reaches Intention was having a stable device UUID posted, unauthenticated,
+  // to /v1/entitlement/recover on every settings open for the life of the
+  // install.
+  it('asks nothing on the byok route, on a build with a bridge and an id to send', async () => {
+    const { ctx, fetch } = loadBilling({ window: storeBridge(), userAgent: ANDROID_UA });
+    expect(await ctx.attemptSilentRecovery('https://api.test', { route: 'byok' })).toBe(null);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  // The one exception, and it is a person pressing a button rather than a
+  // route: "Restore credit from a previous install" is somebody asking, and
+  // refusing it on the byok route would make the button a decoration for the
+  // one user on a custom key who does have credit stranded somewhere.
+  it('asks on any route when the user pressed the button', async () => {
+    const fetch = makeMockFetch({ active: true, token: 't', balanceCredits: 10 });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: ANDROID_UA, fetch });
+    await ctx.attemptSilentRecovery('https://api.test', { route: 'byok', userAsked: true });
+    expect(fetch.calls.map(c => c.url)).toEqual(['https://api.test/v1/entitlement/recover']);
+  });
+
+  // Fail closed, so the next call site added here has to say which route it is
+  // on before it can send anything.
+  it('asks nothing when the caller names no route at all', async () => {
+    const { ctx, fetch } = loadBilling({ window: storeBridge(), userAgent: ANDROID_UA });
+    expect(await ctx.attemptSilentRecovery('https://api.test')).toBe(null);
+    expect(await ctx.attemptSilentRecovery('https://api.test', { route: 'something-new' })).toBe(null);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  // refreshEntitlement's doc comment promises it falls back to the entitlement
+  // we already hold rather than throwing, and this is the door that voided it:
+  // the last-resort recovery call is the one thing in there that can reject,
+  // and nothing above it caught. reconcileEntitlement -> refreshAccessUI ->
+  // showSettingsView is an un-awaited chain, so one 500 here took the whole
+  // settings page with it.
+  it('does not throw out of refreshEntitlement when the last resort fails too', async () => {
+    const fetch = makeMockFetch((url) => url.endsWith('/recover')
+      ? { status: 500, json: { code: 'server_error', error: 'boom' } }
+      : { status: 401, json: { code: 'entitlement_invalid', error: 'gone' } });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    const out = await ctx.refreshEntitlement({ active: true, token: 'stale', source: 'apple' },
+      'https://api.test', { route: 'hosted' });
+    expect(fetch.calls.map(c => c.url.split('/').pop())).toEqual(['refresh', 'recover']);
+    expect(out.active).toBe(false);
+    expect(out.lastError).toBe('entitlement_invalid');
+  });
+
+  it('does not ask when the bridge has no account id to give', async () => {
+    const { ctx, fetch } = loadBilling({ window: storeBridge(''), userAgent: SAFARI_UA });
+    expect(await ctx.attemptSilentRecovery('https://api.test', { route: 'locked' })).toBe(null);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  // refreshEntitlement is the single funnel: every path that can discover a
+  // dead entitlement already passes through its rejected-token branch.
+  it('is reached from refreshEntitlement when the token has aged out', async () => {
+    const fetch = makeMockFetch((url) => url.endsWith('/refresh')
+      ? { status: 401, json: { code: 'entitlement_invalid', error: 'gone' } }
+      : { active: true, balanceCredits: 900, token: 'fresh' });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    const out = await ctx.refreshEntitlement({ token: 'stale', source: 'apple' }, 'https://api.test',
+      { route: 'hosted' });
+    expect(out.active).toBe(true);
+    expect(out.token).toBe('fresh');
+    expect(fetch.calls.map(c => c.url)).toContain('https://api.test/v1/entitlement/recover');
+  });
+
+  it('is not reached when the stored receipt still verifies', async () => {
+    const fetch = makeMockFetch((url) => url.endsWith('/refresh')
+      ? { status: 401, json: { code: 'entitlement_invalid', error: 'gone' } }
+      : { active: true, balanceCredits: 500, token: 'from-receipt' });
+    const { ctx } = loadBilling({ window: storeBridge(), userAgent: SAFARI_UA, fetch });
+    const out = await ctx.refreshEntitlement(
+      { token: 'stale', source: 'apple', receipt: 'jws' }, 'https://api.test', { route: 'hosted' });
+    expect(out.token).toBe('from-receipt');
+    expect(fetch.calls.map(c => c.url)).not.toContain('https://api.test/v1/entitlement/recover');
+  });
+});
+
+describe('the recovery check marker', () => {
+  it('is carried through normalizeEntitlement', () => {
+    const { ctx } = loadBilling();
+    expect(ctx.normalizeEntitlement({ active: true, recoveryCheckedAt: 1234 }).recoveryCheckedAt).toBe(1234);
+    expect(ctx.normalizeEntitlement({ active: true }).recoveryCheckedAt).toBe(0);
+  });
+
+  // It moves every time we ask the backend a question, so counting it would
+  // make each recovery check look like a change and re-render forever — the
+  // same trap updatedAt is already excluded for.
+  it('is ignored by entitlementSignature, so a check is not a change', () => {
+    const { ctx } = loadBilling();
+    const base = { active: true, token: 't', balanceCredits: 10 };
+    expect(ctx.entitlementSignature({ ...base, recoveryCheckedAt: 0 }))
+      .toBe(ctx.entitlementSignature({ ...base, recoveryCheckedAt: Date.now() }));
+  });
+});
+
+describe('recovery codes', () => {
+  it('mints one with the entitlement token as authorization', async () => {
+    const fetch = makeMockFetch({ code: 'INT-AAAA-BBBB-CCCC-DDDD' });
+    const { ctx } = loadBilling({ fetch });
+    const out = await ctx.requestRecoveryCode({ token: 'tok' }, 'https://api.test');
+    expect(out.code).toBe('INT-AAAA-BBBB-CCCC-DDDD');
+    expect(fetch.calls[0].url).toBe('https://api.test/v1/entitlement/recovery-code');
+    expect(fetch.calls[0].init.headers.authorization).toBe('Bearer tok');
+    expect(JSON.parse(fetch.calls[0].init.body)).toEqual({ rotate: false });
+  });
+
+  it('asks for a replacement when told to rotate', async () => {
+    const fetch = makeMockFetch({ code: 'INT-EEEE-FFFF-GGGG-HHHH' });
+    const { ctx } = loadBilling({ fetch });
+    await ctx.requestRecoveryCode({ token: 'tok' }, 'https://api.test', { rotate: true });
+    expect(JSON.parse(fetch.calls[0].init.body)).toEqual({ rotate: true });
+  });
+
+  it('refuses without a live session to mint from', async () => {
+    const { ctx, fetch } = loadBilling();
+    await expect(ctx.requestRecoveryCode(null, 'https://api.test')).rejects.toThrow(/No coaching credit/);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  // The backend refuses a browser link-code session with a `code`, and the
+  // hand-rolled fetch this replaced dropped it — reporting every refusal as a
+  // bare message with nothing a caller could branch on.
+  it('surfaces the backend refusal code, not just its message', async () => {
+    const fetch = makeMockFetch({ status: 403, json: { code: 'store_session_required', error: 'nope' } });
+    const { ctx } = loadBilling({ fetch });
+    await expect(ctx.requestRecoveryCode({ token: 'tok' }, 'https://api.test'))
+      .rejects.toMatchObject({ code: 'store_session_required' });
+  });
+
+  // Copied off paper by someone who has just lost a device: the one moment
+  // where typing it in lower case is likeliest and being told "that code isn't
+  // valid" is worst. The alphabet has no lower case in it at all.
+  it('upper-cases a code typed in lower case before sending it', async () => {
+    const fetch = makeMockFetch({ active: true, token: 't' });
+    const { ctx } = loadBilling({ fetch });
+    await ctx.redeemAccessCode('  int-aaaa-bbbb  ', 'https://api.test');
+    expect(JSON.parse(fetch.calls[0].init.body)).toEqual({ code: 'INT-AAAA-BBBB' });
+  });
+
+  // The fix for the defect that made this feature useless to everybody who was
+  // already paying. The server only mints for a session that says how it proved
+  // itself, and every token minted before that claim existed says nothing — so
+  // an existing paying device got a flat 403 that a refresh carried forward for
+  // a year, rendered in the UI as "try again in a moment". It still holds the
+  // one thing that fixes that: the store receipt.
+  it('re-verifies the stored receipt and retries once when the session predates src', async () => {
+    let mints = 0;
+    const fetch = makeMockFetch((url) => {
+      if (url.endsWith('/verify')) return { active: true, token: 'freshly-stamped', balanceCredits: 400 };
+      mints += 1;
+      return mints === 1
+        ? { status: 403, json: { code: 'store_session_required', error: 'nope' } }
+        : { code: 'INT-AAAA-BBBB-CCCC-DDDD' };
+    });
+    const { ctx } = loadBilling({ fetch });
+    const upgrades = [];
+    const out = await ctx.requestRecoveryCode(
+      { active: true, token: 'legacy', source: 'apple', receipt: 'jws' },
+      'https://api.test',
+      { onUpgrade: (e) => { upgrades.push(e); } }
+    );
+    expect(out.code).toBe('INT-AAAA-BBBB-CCCC-DDDD');
+    expect(fetch.calls.map(c => c.url.split('/').pop()))
+      .toEqual(['recovery-code', 'verify', 'recovery-code']);
+    // The retry uses the token the re-verification just minted, not the one
+    // that was refused.
+    expect(fetch.calls[0].init.headers.authorization).toBe('Bearer legacy');
+    expect(fetch.calls[2].init.headers.authorization).toBe('Bearer freshly-stamped');
+    // And the caller is handed the upgraded session to persist, or the next
+    // settings open pays for the whole dance again.
+    expect(upgrades).toHaveLength(1);
+    expect(upgrades[0].token).toBe('freshly-stamped');
+    expect(upgrades[0].receipt).toBe('jws');
+  });
+
+  // A browser that redeemed a link code has no receipt, and the refusal is the
+  // correct answer for it — escalating a single-use fifteen-minute code into a
+  // permanent one is exactly what the server is refusing. It must not be
+  // retried into a loop.
+  it('does not retry when there is no receipt to re-verify with', async () => {
+    const fetch = makeMockFetch({ status: 403, json: { code: 'store_session_required', error: 'nope' } });
+    const { ctx } = loadBilling({ fetch });
+    await expect(ctx.requestRecoveryCode({ active: true, token: 'link-tok', source: 'code' },
+      'https://api.test')).rejects.toMatchObject({ code: 'store_session_required' });
+    expect(fetch.calls).toHaveLength(1);
+  });
+
+  it('retries nothing for a refusal that is not about the session kind', async () => {
+    const fetch = makeMockFetch({ status: 429, json: { code: 'rate_limited', error: 'slow down' } });
+    const { ctx } = loadBilling({ fetch });
+    await expect(ctx.requestRecoveryCode({ active: true, token: 'tok', source: 'apple', receipt: 'jws' },
+      'https://api.test')).rejects.toMatchObject({ code: 'rate_limited' });
+    expect(fetch.calls).toHaveLength(1);
+  });
+});
+
+// Which sessions may be OFFERED the block at all. The server has always
+// refused some of them; what this decides is whether the user is shown a
+// button that can only fail.
+describe('who may be offered a recovery code', () => {
+  const can = (entitlement) => loadBilling().ctx.canMintRecoveryCode(entitlement);
+
+  it('says yes to the paying device and to a session that redeemed the paper code', () => {
+    expect(can({ token: 't', src: 'store' })).toBe(true);
+    expect(can({ token: 't', src: 'paper' })).toBe(true);
+  });
+
+  it('says no to a browser link session and to one recovered from an account id', () => {
+    expect(can({ token: 't', src: 'link', source: 'code' })).toBe(false);
+    expect(can({ token: 't', src: 'account', source: 'apple' })).toBe(false);
+  });
+
+  // ...unless that session is also holding a receipt, which can always be
+  // turned back into a store session — the refusal is about what the token can
+  // prove, and the receipt proves more than it does.
+  it('says yes to any session that still holds a store receipt', () => {
+    expect(can({ token: 't', src: 'account', source: 'apple', receipt: 'jws' })).toBe(true);
+  });
+
+  // Everything stored before this release carries no src at all, and the two
+  // cases behind that silence are told apart by the receipt: a paying device
+  // kept one and can be upgraded in a single run, a linked browser never had
+  // one and never will be.
+  it('reads a session stored before src existed off its receipt', () => {
+    expect(can({ token: 't', source: 'apple', receipt: 'jws' })).toBe(true);
+    expect(can({ token: 't', source: 'code', receipt: null })).toBe(false);
+    expect(can({ token: '', source: 'apple', receipt: 'jws' })).toBe(false);
+    expect(can(null)).toBe(false);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// What the paywall is allowed to put on screen
+// ---------------------------------------------------------------------------
+//
+// Guideline 3.1.1 forbids unlocking in-app functionality against anything
+// bought outside IAP, and Apple has already rejected a build of this app for
+// leaving the key field merely unadvertised. Everything below asserts on the
+// RENDERED TREE rather than on a flag or a source string, because the flag was
+// never the thing review looked at.
+//
+// renderPaywall builds with createElement/textContent throughout, so the shim
+// only has to answer element construction, parenting and property writes —
+// no layout, no selectors, no event loop. A full jsdom would answer questions
+// nothing here asks.
+
+function makeNode(tagName) {
+  const classes = new Set();
+  const attrs = {};
+  const handlers = {};
+  const node = {
+    tagName,
+    children: [],
+    dataset: {},
+    style: {},
+    hidden: false,
+    disabled: false,
+    open: false,
+    _handlers: handlers,
+    classList: {
+      add: (...c) => c.forEach(x => classes.add(x)),
+      remove: (...c) => c.forEach(x => classes.delete(x)),
+      contains: (c) => classes.has(c),
+      toggle: (c, on) => {
+        const want = on === undefined ? !classes.has(c) : !!on;
+        if (want) classes.add(c); else classes.delete(c);
+        return want;
+      }
+    },
+    setAttribute: (k, v) => { attrs[k] = String(v); },
+    getAttribute: (k) => (k in attrs ? attrs[k] : null),
+    appendChild: (child) => { node.children.push(child); return child; },
+    append: (...kids) => { node.children.push(...kids); },
+    addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+    querySelector: () => null
+  };
+  // The one thing renderPaywall does that is not construction: it empties the
+  // container it is handed, and the "busy" helper asks whether a button has
+  // element children before it flattens the label.
+  Object.defineProperty(node, 'innerHTML', {
+    get: () => '',
+    set: () => { node.children.length = 0; }
+  });
+  Object.defineProperty(node, 'firstElementChild', {
+    get: () => node.children[0] || null
+  });
+  return node;
+}
+
+// Every node in the tree, in document order.
+function flatten(node, out = []) {
+  for (const child of node.children || []) {
+    out.push(child);
+    flatten(child, out);
+  }
+  return out;
+}
+
+const allText = (node) => flatten(node).map(n => n.textContent || '').join(' ');
+const byId = (node, id) => flatten(node).find(n => n.id === id) || null;
+const byClass = (node, className) => flatten(node)
+  .filter(n => typeof n.className === 'string' && n.className.split(' ').includes(className));
+
+function loadPaywall({ window: win = {}, userAgent, fetch } = {}) {
+  const mockFetch = fetch || makeMockFetch({});
+  const navigator = { userAgent };
+  const document = { createElement: makeNode, getElementById: () => null };
+  const ctx = loadSource(['providers.js', 'billing.js'], {
+    fetch: mockFetch,
+    extraGlobals: { window: { ...win, navigator }, navigator, document }
+  });
+  return { ctx, container: makeNode('div'), fetch: mockFetch };
+}
+
+// What verifyPurchase actually leaves behind: the receipt is stored alongside
+// the token (see "posts the receipt to the backend and keeps it for later
+// re-checks" above), and `src` is how the server says this session proved
+// itself. Both matter to the paywall now — whether a recovery code may be
+// offered is decided from them — so the fixture has to be the real shape.
+const ACTIVE = { active: true, token: 'tok', balanceCredits: 1240, source: 'apple', receipt: 'jws', src: 'store' };
+
+// Rendered on every store and managed build, so every one of these is a thing
+// review would see.
+const forbidden = (container, ctx) => {
+  const nodes = flatten(container);
+  const text = allText(container);
+  return {
+    anchors: nodes.filter(n => n.tagName === 'a').length,
+    keyFields: nodes.filter(n => n.type === 'password' || n.id === 'int-pw-key').length,
+    providerPickers: nodes.filter(n => n.id === 'int-pw-provider').length,
+    // The vendor names themselves, taken from the provider table rather than
+    // hardcoded, so a provider added later is covered without an edit here.
+    vendors: Object.entries(ctx.PROVIDERS)
+      .filter(([, cfg]) => !cfg.hosted)
+      .map(([, cfg]) => cfg.label)
+      .filter(label => text.includes(label)),
+    externalUrls: text.match(/https?:\/\//g) || []
+  };
+};
+
+describe('Guideline 3.1.1: what an Apple build may render', () => {
+  const bridged = () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    return b;
+  };
+
+  it('shows no key field, no provider name and no link on a store build', async () => {
+    const { ctx, container } = loadPaywall({ window: bridged(), userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, { entitlement: null, onRestore: async () => {}, onPurchase: async () => {}, onRedeem: async () => {} });
+    expect(forbidden(container, ctx)).toEqual({
+      anchors: 0, keyFields: 0, providerPickers: 0, vendors: [], externalUrls: []
+    });
+  });
+
+  it('shows none of them on a store build with credit either', async () => {
+    const { ctx, container } = loadPaywall({ window: bridged(), userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: ACTIVE,
+      onRestore: async () => {}, onPurchase: async () => {},
+      onLinkBrowser: async () => ({ code: 'INT-AAAA-BBBB' }),
+      onShowRecoveryCode: async () => ({ code: 'INT-AAAA-BBBB-CCCC-DDDD' })
+    });
+    expect(forbidden(container, ctx)).toEqual({
+      anchors: 0, keyFields: 0, providerPickers: 0, vendors: [], externalUrls: []
+    });
+  });
+
+  it('shows none of them on a managed build — the Safari extension pages', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: SAFARI_UA });
+    expect(ctx.BILLING_MODE).toBe('managed');
+    await ctx.renderPaywall(container, { entitlement: null, onRedeem: async () => {} });
+    expect(forbidden(container, ctx)).toEqual({
+      anchors: 0, keyFields: 0, providerPickers: 0, vendors: [], externalUrls: []
+    });
+  });
+
+  it('shows none of them on a managed build with credit', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: ACTIVE,
+      onShowRecoveryCode: async () => ({ code: 'INT-AAAA-BBBB-CCCC-DDDD' })
+    });
+    expect(forbidden(container, ctx)).toEqual({
+      anchors: 0, keyFields: 0, providerPickers: 0, vendors: [], externalUrls: []
+    });
+  });
+
+  // The counterpart: the guard has to be able to fail, or it proves nothing.
+  // Chrome and Firefox may show all of it, because no store sells anything
+  // there and the key is the only route a browser can actually finish.
+  it('does render the key route on a browser build, so the guard can fail', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, { entitlement: null, onSaveKey: async () => {}, onRedeem: async () => {} });
+    const seen = forbidden(container, ctx);
+    expect(seen.keyFields).toBeGreaterThan(0);
+    expect(seen.providerPickers).toBe(1);
+    expect(seen.vendors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('somewhere to type a code', () => {
+  // A Safari user with credit bought in the app, and anyone holding a recovery
+  // code from a device they no longer own, both reached this screen and found
+  // nothing to type into: the managed branch returned before any input.
+  it('renders the code input on a managed build', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, { entitlement: null, onRedeem: async () => {} });
+    expect(byId(container, 'int-pw-code-input')).toBeTruthy();
+    expect(allText(container)).toContain('Recovery or access code');
+  });
+
+  it('renders it on a store build with no credit too', async () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    const { ctx, container } = loadPaywall({ window: b, userAgent: ANDROID_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: null, onRestore: async () => {}, onPurchase: async () => {}, onRedeem: async () => {}
+    });
+    expect(byId(container, 'int-pw-code-input')).toBeTruthy();
+  });
+
+  // The compact paywall renders inside a blocked page, which is the worst
+  // possible moment to send someone off to find a code.
+  it('keeps it out of the in-gate paywall', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, { entitlement: null, onRedeem: async () => {}, compact: true });
+    expect(byId(container, 'int-pw-code-input')).toBe(null);
+  });
+});
+
+describe('the recovery code block', () => {
+  // The browser session that may mint: someone who typed a recovery code into
+  // Chrome holds the strongest artefact there is, so re-showing it escalates
+  // nothing and the server says so ('paper'). The other browser session — one
+  // that redeemed a 15-minute link code from a phone — may not, and has its own
+  // tests below.
+  const PAPER = { active: true, token: 'tok', balanceCredits: 1240, source: 'code', src: 'paper' };
+  const recoveryOpts = (over = {}) => ({
+    entitlement: PAPER,
+    onRestore: async () => {},
+    onPurchase: async () => {},
+    onShowRecoveryCode: async () => ({ code: 'INT-AAAA-BBBB-CCCC-DDDD' }),
+    ...over
+  });
+
+  // The reveal button, pressed. Nothing in this file dispatches real events, so
+  // the handler registered on the node is what gets called.
+  const press = async (node) => {
+    for (const fn of (node._handlers.click || [])) await fn();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const revealBtn = (container) => byClass(container, 'int-pw-recovery-reveal')[0];
+
+  // On a browser there is no bridge and no surviving identifier of any kind:
+  // chrome.storage is wiped on uninstall, sync included. The written-down code
+  // is not one durability route among several, it is the only one.
+  it('is open by default on a browser build, one press from the code', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts());
+    const block = byClass(container, 'int-pw-recovery')[0];
+    expect(block.tagName).toBe('div');
+    expect(block.className).toContain('int-pw-recovery-open');
+    await press(revealBtn(container));
+    expect(byClass(container, 'int-pw-recovery-code')[0].textContent).toBe('INT-AAAA-BBBB-CCCC-DDDD');
+  });
+
+  // The defect this pair pins. Open is not the same as fetched: the block used
+  // to fetch on sight wherever it rendered open, which made merely opening
+  // Settings a backend request — and on a browser build that went out even
+  // while the coach was running on the user's own API key, a path PRIVACY.md
+  // promises never touches Intention's backend. The block still leads the
+  // card; the request waits for the press.
+  it('asks for nothing until pressed, even rendered open', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    let asked = 0;
+    await ctx.renderPaywall(container, recoveryOpts({
+      onShowRecoveryCode: async () => { asked += 1; return { code: 'INT-AAAA-BBBB-CCCC-DDDD' }; }
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(asked).toBe(0);
+    expect(byClass(container, 'int-pw-recovery-open')).toHaveLength(1);
+    await press(revealBtn(container));
+    expect(asked).toBe(1);
+  });
+
+  // Nothing to copy and nothing to rotate before there is a code, and the
+  // placeholder well would otherwise sit there reading "…".
+  it('keeps the code well and its buttons out of the way until then', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts());
+    expect(byClass(container, 'int-pw-recovery-code')[0].hidden).toBe(true);
+    expect(byClass(container, 'int-pw-recovery-actions')[0].hidden).toBe(true);
+    await press(revealBtn(container));
+    expect(byClass(container, 'int-pw-recovery-code')[0].hidden).toBe(false);
+    expect(byClass(container, 'int-pw-recovery-actions')[0].hidden).toBe(false);
+    expect(revealBtn(container).hidden).toBe(true);
+  });
+
+  it('is a collapsed disclosure on a store build, and asks for nothing until opened', async () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    const { ctx, container } = loadPaywall({ window: b, userAgent: SAFARI_UA });
+    let asked = 0;
+    await ctx.renderPaywall(container, recoveryOpts({
+      entitlement: ACTIVE,
+      onShowRecoveryCode: async () => { asked += 1; return { code: 'INT-ZZZZ-YYYY-XXXX-WWWW' }; }
+    }));
+    const block = byClass(container, 'int-pw-recovery')[0];
+    expect(block.tagName).toBe('details');
+    expect(asked).toBe(0);
+  });
+
+  // Straight after a purchase the code is the thing to do, not a disclosure to
+  // find later — and the copy leads with why rather than with what.
+  it('leads with it when credit has just landed, and fetches it unasked', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    let asked = 0;
+    await ctx.renderPaywall(container, recoveryOpts({
+      justPurchased: true,
+      onShowRecoveryCode: async () => { asked += 1; return { code: 'INT-AAAA-BBBB-CCCC-DDDD' }; }
+    }));
+    const block = byClass(container, 'int-pw-recovery')[0];
+    expect(block.className).toContain('int-pw-recovery-open');
+    expect(allText(block)).toContain('Save your recovery code');
+    expect(allText(block)).toContain('tied to this device, not to an account');
+    // The one screen that earns the unasked request: the user is already
+    // mid-transaction with the backend, "write this down now" is the entire
+    // point of it, and a purchase cannot have happened on the custom-key path.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(asked).toBe(1);
+    expect(byClass(container, 'int-pw-recovery-code')[0].textContent).toBe('INT-AAAA-BBBB-CCCC-DDDD');
+  });
+
+  // Nothing to mint from, and a blocked page is not where anyone writes
+  // something down.
+  it('is absent with no callback, and absent in the compact paywall', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts({ onShowRecoveryCode: undefined }));
+    expect(byClass(container, 'int-pw-recovery')).toHaveLength(0);
+
+    const second = loadPaywall({ userAgent: CHROME_UA });
+    await second.ctx.renderPaywall(second.container, recoveryOpts({ compact: true }));
+    expect(byClass(second.container, 'int-pw-recovery')).toHaveLength(0);
+  });
+
+  // The other browser session, and the defect this pair exists for. A Chrome
+  // user who redeemed a 15-minute link code from their phone holds a bearer
+  // that may spend the balance but may never mint the paper code — the server
+  // has always said so. What the paywall used to do with that was render the
+  // block expanded (browsers get it expanded, since it is their only
+  // durability), fetch on sight, take the 403 and print "try again in a
+  // moment" for ever. It never worked and never would.
+  it('is not offered to a browser linked from a phone, which is told where the code is', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    let asked = 0;
+    await ctx.renderPaywall(container, recoveryOpts({
+      entitlement: { active: true, token: 'tok', balanceCredits: 400, source: 'code', src: 'link' },
+      onShowRecoveryCode: async () => { asked += 1; throw new Error('should never be called'); }
+    }));
+    expect(byClass(container, 'int-pw-recovery')).toHaveLength(0);
+    expect(asked).toBe(0);
+    expect(allText(container)).toContain('recovery code lives on that device');
+  });
+
+  // The same session as stored before the server stamped one: a redeemed code
+  // leaves source 'code' and no receipt, and no recovery code existed to be
+  // redeemed before this release, so that shape is a link session too.
+  it('reads a link session stored before src existed the same way', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts({
+      entitlement: { active: true, token: 'tok', balanceCredits: 400, source: 'code', receipt: null }
+    }));
+    expect(byClass(container, 'int-pw-recovery')).toHaveLength(0);
+    expect(allText(container)).toContain('recovery code lives on that device');
+  });
+
+  // ...while a device that bought the credit before the claim existed still
+  // gets the block, because its stored receipt is what requestRecoveryCode
+  // upgrades the session with.
+  it('is still offered to a paying device whose session predates src', async () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    const { ctx, container } = loadPaywall({ window: b, userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, recoveryOpts({
+      entitlement: { active: true, token: 'tok', balanceCredits: 400, source: 'apple', receipt: 'jws' }
+    }));
+    expect(byClass(container, 'int-pw-recovery')).toHaveLength(1);
+    expect(allText(container)).not.toContain('recovery code lives on that device');
+  });
+
+  // A refusal that will never change its mind is not "try again in a moment".
+  // This block is kept off the screen for the session kind the server refuses
+  // outright, so reaching here means something rarer — a receipt that no
+  // longer verifies, say — but the message still has to be the true one.
+  it('says a refusal is a refusal, not a hiccup', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts({
+      onShowRecoveryCode: async () => {
+        const e = new Error('nope');
+        e.code = 'store_session_required';
+        throw e;
+      }
+    }));
+    await press(revealBtn(container));
+    expect(byClass(container, 'int-pw-recovery-status')[0].textContent)
+      .toContain('can only be shown on the device that bought the credit');
+  });
+
+  // A code we could not fetch must not read as "your credit is in trouble",
+  // which is what a red error under a live balance says.
+  it('reports a failure on its own line, not in the paywall error slot', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, recoveryOpts({
+      onShowRecoveryCode: async () => { throw new Error('boom'); }
+    }));
+    await press(revealBtn(container));
+    expect(byClass(container, 'int-pw-recovery-status')[0].textContent)
+      .toContain("Couldn't get a recovery code right now");
+    expect(byClass(container, 'int-pw-error')[0].hidden).toBe(true);
+    // A failed fetch leaves nothing to copy, and the button is also the retry.
+    expect(revealBtn(container).hidden).toBe(false);
+    expect(byClass(container, 'int-pw-recovery-code')[0].hidden).toBe(true);
+  });
+});
+
+describe('restoring credit from a previous install', () => {
+  const bridged = () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    return b;
+  };
+
+  // A different question from "Recover an interrupted purchase", which asks
+  // the STORE about a transaction that never finished and correctly answers
+  // "no pending purchase found" after a reinstall.
+  it('offers its own button on a store build with no credit', async () => {
+    const { ctx, container } = loadPaywall({ window: bridged(), userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: null, onRestore: async () => {}, onPurchase: async () => {},
+      onRecoverFromDevice: async () => null
+    });
+    expect(byClass(container, 'int-pw-recover')).toHaveLength(1);
+  });
+
+  it('does not offer it once there is credit', async () => {
+    const { ctx, container } = loadPaywall({ window: bridged(), userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: ACTIVE, onRestore: async () => {}, onPurchase: async () => {},
+      onRecoverFromDevice: async () => null
+    });
+    expect(byClass(container, 'int-pw-recover')).toHaveLength(0);
+  });
+
+  // `undefined` is "this build cannot tell" — Apple's bridge omits the field
+  // and the notice would be untrue there.
+  it('explains a fresh install only when the bridge actually said so', async () => {
+    const withFlag = loadPaywall({ window: bridged(), userAgent: ANDROID_UA });
+    await withFlag.ctx.renderPaywall(withFlag.container, {
+      entitlement: null, onRestore: async () => {}, onPurchase: async () => {}, accountRestored: false
+    });
+    expect(allText(withFlag.container)).toContain('This looks like a fresh install');
+
+    const without = loadPaywall({ window: bridged(), userAgent: ANDROID_UA });
+    await without.ctx.renderPaywall(without.container, {
+      entitlement: null, onRestore: async () => {}, onPurchase: async () => {}
+    });
+    expect(allText(without.container)).not.toContain('This looks like a fresh install');
+  });
+});
+
+// One box, two kinds of code, and the placeholder is the only thing on it that
+// shows a shape.
+describe('the code box', () => {
+  const codeInput = (container) => flatten(container).find(n => n.id === 'int-pw-code-input');
+
+  // On a store build the label says "Recovery or access code" and the hint
+  // underneath says to paste the one from the old device — so the shape shown
+  // has to be a recovery code's. It is four groups (RECOVERY_BODY_LEN is 16 in
+  // server/src/store.js), not the two a browser link code has.
+  it('shows the recovery code shape where a recovery code is what is asked for', async () => {
+    const b = bridge();
+    b.intentionBilling.accountToken = (cb) => cb({ token: 'acct' });
+    const { ctx, container } = loadPaywall({ window: b, userAgent: SAFARI_UA });
+    await ctx.renderPaywall(container, {
+      entitlement: null, onRestore: async () => {}, onPurchase: async () => {}, onRedeem: async () => {}
+    });
+    expect(allText(container)).toContain('Recovery or access code');
+    expect(codeInput(container).placeholder).toBe('INT-XXXX-XXXX-XXXX-XXXX');
+  });
+
+  // In a browser the box is called "Access code" and the likely paste is a
+  // fresh two-group link from a phone, so that is the shape shown there.
+  it('shows the access code shape in a browser', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, { entitlement: null, onRedeem: async () => {}, onSaveKey: async () => {} });
+    expect(codeInput(container).placeholder).toBe('INT-XXXX-XXXX');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// options-access.js — the page that drives all of the above
+// ---------------------------------------------------------------------------
+//
+// It lives here rather than in a file of its own because it is the other half
+// of this one: options-access.js holds no rules about billing, it only decides
+// when to ask billing.js a question and what to do with the answer. Every
+// defect below is on that seam — a question asked on the wrong route, an answer
+// written over a purchase, an exception from an opportunistic question taking
+// the whole settings page with it.
+//
+// The stubbed background is deliberately thin. What the real one does with a
+// merge is pinned in tests/background.test.js; what matters here is which
+// message the page sends and what it does next.
+function loadAccessPage({ userAgent = ANDROID_UA, fetch, entitlement = null, route = 'locked',
+  accountToken = 'DEVICE-UUID', bridge: hasBridge = true } = {}) {
+  const mockFetch = fetch || makeMockFetch({ status: 404, json: { code: 'no_balance_for_account', error: 'none' } });
+  const stored = { entitlement };
+  const sent = [];
+  const sendBg = async (message) => {
+    sent.push(message);
+    if (message.action === 'getAccess') return { route, entitlement: stored.entitlement };
+    if (message.action === 'saveEntitlement') {
+      stored.entitlement = message.entitlement;
+      return { ok: true, entitlement: stored.entitlement };
+    }
+    if (message.action === 'mergeEntitlement') {
+      stored.entitlement = { ...(stored.entitlement || { active: false, source: '' }), ...message.entitlement };
+      return { ok: true, entitlement: stored.entitlement };
+    }
+    return { ok: true };
+  };
+  const win = {
+    navigator: { userAgent },
+    addEventListener: () => {}
+  };
+  if (hasBridge) win.intentionBilling = { accountToken: (cb) => cb({ token: accountToken }), products: (cb) => cb({ available: true, products: [] }) };
+  const container = makeNode('div');
+  const ctx = loadSource(['providers.js', 'billing.js', 'options-access.js'], {
+    fetch: mockFetch,
+    extraGlobals: {
+      window: win,
+      navigator: win.navigator,
+      document: { createElement: makeNode, getElementById: (id) => (id === 'access-card' ? container : null) },
+      sendBg,
+      getConfig: async () => ({ backendUrl: 'https://api.test' }),
+      refreshCreditChip: async () => {},
+      HAS_APP_BLOCKING: true
+    }
+  });
+  return { ctx, fetch: mockFetch, stored, sent, container };
+}
+
+describe('the settings page and an unreachable backend', () => {
+  // The defect this whole harness exists for. attemptSilentRecovery rethrows
+  // anything that is not a 404, and there was no catch anywhere above it:
+  // recoverStrandedCredit -> reconcileEntitlement -> refreshAccessUI ->
+  // options.js's showSettingsView, which does not await and does not catch. One
+  // offline recovery check therefore aborted the entire settings render — no
+  // blocked-site list, no blocking-mode card, no apps card, no stats, and not
+  // one button bound. The settings screen was a dead husk whenever the device
+  // was offline.
+  it('does not throw when an opportunistic recovery check fails', async () => {
+    const offline = async () => { throw new TypeError('Failed to fetch'); };
+    const { ctx } = loadAccessPage({ fetch: offline });
+    await expect(ctx.reconcileEntitlement(null, 'locked')).resolves.toBe(null);
+  });
+
+  it('renders the paywall and returns, offline, so the rest of the page runs', async () => {
+    const offline = async () => { throw new TypeError('Failed to fetch'); };
+    const { ctx, container } = loadAccessPage({ fetch: offline });
+    await expect(ctx.refreshAccessUI('access-card')).resolves.toBeUndefined();
+    expect(container.children.length).toBeGreaterThan(0);
+  });
+
+  // Nothing is written down either: we were not told anything, so the 24-hour
+  // "we asked and there was nothing" marker must not be recorded. A device that
+  // was merely offline has to ask again next time.
+  it('records no answer it never received', async () => {
+    const offline = async () => { throw new TypeError('Failed to fetch'); };
+    const { ctx, stored, sent } = loadAccessPage({ fetch: offline });
+    await ctx.reconcileEntitlement(null, 'locked');
+    expect(stored.entitlement).toBe(null);
+    expect(sent.filter(m => m.action === 'mergeEntitlement' || m.action === 'saveEntitlement')).toHaveLength(0);
+  });
+
+  // The one caller somebody is watching: the manual button, whose own handler
+  // catches and shows the message.
+  it('still reports a failure to the button that asked for it', async () => {
+    const offline = async () => { throw new TypeError('Failed to fetch'); };
+    const { ctx } = loadAccessPage({ fetch: offline });
+    await expect(ctx.recoverStrandedCredit(null, { force: true, route: 'locked' }))
+      .rejects.toThrow(/Failed to fetch/);
+  });
+});
+
+describe('when the settings page asks about a stranded balance', () => {
+  it('asks nothing at all on the byok route, bridge and account id notwithstanding', async () => {
+    const { ctx, fetch, stored, sent } = loadAccessPage({ route: 'byok' });
+    await ctx.reconcileEntitlement(null, 'byok');
+    expect(fetch.calls).toHaveLength(0);
+    // And writes no entitlement object to record a question nobody asked.
+    expect(stored.entitlement).toBe(null);
+    expect(sent.filter(m => m.action === 'mergeEntitlement')).toHaveLength(0);
+  });
+
+  it('still asks on the locked route, which is what it is for', async () => {
+    const { ctx, fetch } = loadAccessPage({ route: 'locked' });
+    await ctx.reconcileEntitlement(null, 'locked');
+    expect(fetch.calls.map(c => c.url)).toEqual(['https://api.test/v1/entitlement/recover']);
+  });
+
+  // The manual button is the user asking, whatever route the coach is on.
+  it('honours the manual button on the byok route', async () => {
+    const { ctx, fetch } = loadAccessPage({ route: 'byok' });
+    await ctx.recoverStrandedCredit(null, { force: true, route: 'byok' });
+    expect(fetch.calls.map(c => c.url)).toEqual(['https://api.test/v1/entitlement/recover']);
+  });
+});
+
+describe('a purchase that lands while the recovery check is in flight', () => {
+  // SEVERE, and the reason every recovery write is a merge now. The read
+  // happens before an unbounded await; the write happened after it, through a
+  // whole-object save. Buy a top-up while /v1/entitlement/recover is still out
+  // on a slow network — returning from the Play sheet fires
+  // 'intention-app-active', which runs a second refreshAccessUI that verifies
+  // and persists the purchase — and the 404 arriving afterwards wrote back a
+  // snapshot taken before any of it. The money was taken, the receipt was
+  // deleted so nothing could re-verify, and the recoveryCheckedAt it wrote in
+  // its place suppressed the re-check for 24 hours.
+  const PURCHASE = {
+    active: true, source: 'google', token: 'TOKEN-FROM-PURCHASE',
+    receipt: 'PLAY-RECEIPT', balanceCredits: 5000
+  };
+
+  it('does not let a 404 overwrite the purchase', async () => {
+    let release;
+    const gate = new Promise(r => { release = r; });
+    const page = loadAccessPage({
+      fetch: async () => {
+        await gate;
+        return { ok: false, status: 404, async json() { return { code: 'no_balance_for_account', error: 'none' }; } };
+      }
+    });
+    const pending = page.ctx.reconcileEntitlement(null, 'locked');
+    page.stored.entitlement = { ...PURCHASE };
+    release();
+    await pending;
+    expect(page.stored.entitlement).toMatchObject(PURCHASE);
+    // ...and the marker it went there to write is still written.
+    expect(page.stored.entitlement.recoveryCheckedAt).toBeGreaterThan(0);
+  });
+
+  // The hit path has the same hazard and one of its own: /v1/entitlement/recover
+  // has never heard of a receipt, so its answer normalizes to receipt: null.
+  // Writing that whole object would delete the only durable proof this device
+  // has.
+  it('keeps the stored receipt when a recovery does find a balance', async () => {
+    let release;
+    const gate = new Promise(r => { release = r; });
+    const page = loadAccessPage({
+      fetch: async () => {
+        await gate;
+        return { ok: true, status: 200, async json() { return { active: true, token: 'ACCOUNT-TOKEN', balanceCredits: 900, src: 'account' }; } };
+      }
+    });
+    const pending = page.ctx.reconcileEntitlement(null, 'locked');
+    page.stored.entitlement = { ...PURCHASE };
+    release();
+    await pending;
+    expect(page.stored.entitlement.receipt).toBe('PLAY-RECEIPT');
+    expect(page.stored.entitlement.balanceCredits).toBe(900);
+  });
+});
+
+describe('the low-balance line in the AI access card', () => {
+  it('appears at or under the shared threshold and not above it', async () => {
+    const low = loadPaywall({ userAgent: CHROME_UA });
+    await low.ctx.renderPaywall(low.container, {
+      entitlement: { ...ACTIVE, balanceCredits: low.ctx.LOW_CREDIT_CREDITS }
+    });
+    expect(byClass(low.container, 'int-pw-low')).toHaveLength(1);
+
+    const fine = loadPaywall({ userAgent: CHROME_UA });
+    await fine.ctx.renderPaywall(fine.container, {
+      entitlement: { ...ACTIVE, balanceCredits: fine.ctx.LOW_CREDIT_CREDITS + 1 }
+    });
+    expect(byClass(fine.container, 'int-pw-low')).toHaveLength(0);
+  });
+
+  // Zero is not low, it is spent — and the paywall is already the screen about
+  // that. background.js's getAccess and its chat reply both carry `> 0` for
+  // exactly this reason, and without it here a sub-1-credit balance produced
+  // three surfaces telling one user three different stories: a header chip
+  // reading "Credit 0" with no warning at all, a gate note saying nothing, and
+  // this line saying "Running low".
+  it('says nothing at a balance that has floored to zero', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, { entitlement: { ...ACTIVE, balanceCredits: 0 } });
+    expect(byClass(container, 'int-pw-low')).toHaveLength(0);
+    expect(allText(container)).not.toContain('Running low');
+  });
+
+  // The balance is credits and never a currency figure: what a top-up credits
+  // is net of the store's commission and Intention's margin, so a £ amount
+  // would read as a broken conversion rather than a game-currency balance.
+  it('still states the balance in credits, never in money', async () => {
+    const { ctx, container } = loadPaywall({ userAgent: CHROME_UA });
+    await ctx.renderPaywall(container, { entitlement: ACTIVE });
+    expect(allText(container)).toContain('1,240 coaching credits');
+    expect(allText(container)).not.toMatch(/[£$€]/);
   });
 });

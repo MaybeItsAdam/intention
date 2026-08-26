@@ -45,6 +45,22 @@ function entitlementIsActive(entitlement) {
   return Date.now() < Number(entitlement.expiresAt) + ENTITLEMENT_GRACE_MS;
 }
 
+// Where "running low" starts. At roughly a thousand credits per pound and a
+// couple of credits a message, a hundred is about fifty more conversations —
+// far enough ahead that a top-up is a decision rather than an interruption,
+// close enough that saying nothing would let someone hit zero mid-sentence.
+//
+// It lives HERE, and only here, for a structural reason rather than a tidiness
+// one. The number is needed by the background worker (which decides it) and by
+// the settings page (which paints the chip), and the note that spends it is
+// rendered by gate-ui.js — but coaching.html loads billing.js and gate-ui.js
+// into ONE global scope, so the same top-level `const` declared in both is a
+// hard SyntaxError that only a page load reveals: eslint's no-undef cannot see
+// a redeclaration across files, and neither can the unit suite. providers.js is
+// the one file all three contexts already share. The content script never
+// receives the number at all — it is handed the boolean.
+const LOW_CREDIT_CREDITS = 100;
+
 const PROVIDERS = {
   intention: {
     label: 'Intention AI',

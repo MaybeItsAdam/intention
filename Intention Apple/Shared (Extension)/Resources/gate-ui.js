@@ -154,6 +154,70 @@ function renderStatsRow(stats) {
   statsRow.style.display = 'flex';
 }
 
+// The credit line above the conversation.
+//
+// It answers a complaint that was never about the gate at all — "there seems
+// to be no means to see credit balance" — by putting the number on the one
+// screen a paying user reliably reaches. Settings is where the balance
+// belongs; the gate is where it is actually looked at.
+//
+// Two voices, one element. A low balance is a warning and says so. A healthy
+// balance is a fact and reads like one, so it is only shown where the gate is
+// the whole screen (the app's own coaching page, which marks its div
+// `data-persistent`) and stays out of the way in the content overlay, where a
+// blocked page is already carrying a conversation the user did not ask for.
+// The host declares that in its own markup rather than this file asking which
+// host it is running in.
+//
+// `credits` is only ever a number the background computed. `lowCredit` is a
+// boolean, which is why the content script never needs the threshold itself.
+//
+// `route` is the third argument and not an optional one, because the balance
+// alone cannot say whether it means anything. getAccess hands back the stored
+// number on every route, so a user who bought credit, spent some of it and then
+// pointed the coach at their own Anthropic key was being told "830 coaching
+// credits left" on every blocked page while every message was billed to that
+// key. The settings chip goes to explicit lengths to hide itself on 'byok' for
+// exactly this reason — a balance shown for a route that does not spend it is
+// not a small inaccuracy, it is the wrong mental model — and this is the same
+// rule on the other surface. An unknown route says nothing, which is the safe
+// direction to be wrong in.
+function renderCreditNote(lowCredit, credits, route) {
+  const note = document.getElementById('int-credit-note');
+  if (!note) return;
+  const remaining = Number(credits || 0);
+  const persistent = note.dataset && note.dataset.persistent !== undefined;
+  if (route !== 'hosted') {
+    note.hidden = true;
+    return;
+  }
+  // Nothing to say at zero either — zero is locked, and the paywall is already
+  // saying that louder.
+  if (!lowCredit && !(persistent && remaining > 0)) {
+    note.hidden = true;
+    return;
+  }
+  note.classList.toggle('int-credit-note-low', !!lowCredit);
+  note.textContent = lowCredit
+    ? `Coaching credit is running low — ${remaining.toLocaleString()} credits left.`
+    : `${remaining.toLocaleString()} coaching credits left.`;
+  note.hidden = false;
+}
+
+// Same line, from a cold start. Best-effort throughout, for the reason the
+// stats strip is: a gate that failed to stand up because a balance could not
+// be fetched would be a far worse bug than a gate with no balance on it.
+function loadCreditNote() {
+  try {
+    chrome.runtime.sendMessage({ action: 'getAccess' }, (access) => {
+      if (chrome.runtime.lastError || !access) return;
+      renderCreditNote(access.lowCredit, access.balanceCredits, access.route);
+    });
+  } catch (e) {
+    console.warn('[Intention]', 'getAccess message threw:', e);
+  }
+}
+
 // Ask the background for this domain's numbers, render them, and hand them
 // back to the caller — which keeps them for showWalkAwayMoment. Best-effort
 // throughout: a gate with no stats strip is a gate; a gate that failed to
@@ -217,6 +281,11 @@ function sendChatMessage(message, timeoutMs = CHAT_TIMEOUT_MS) {
 function createGateConversation(host) {
   const messages = host.messages;
   let sending = false;
+  // Exactly once per gate, in both hosts — this is constructed when the gate
+  // stands up and never again. Deliberately not hung off attemptOpen(): a
+  // resumed conversation skips that, and a returning user is precisely who the
+  // balance is for.
+  loadCreditNote();
   // Only the most recent request's result is allowed to touch the DOM, so a
   // stale response arriving after a timeout and a retry can't double-render.
   let requestSeq = 0;
@@ -309,6 +378,14 @@ function createGateConversation(host) {
     typeMessage(thinking, messages, resp.assistantText || fallbackText, () => {
       if (seq !== requestSeq) return;
       sending = false;
+      // The background computed this while spending the credit, so the line
+      // stays honest turn by turn without a second round trip. Absent on a
+      // route with no balance, where the note has nothing to say anyway —
+      // applyHostedBalance returns null off the hosted route and the field
+      // never rides along, so its presence IS the route.
+      if (resp.balanceCredits !== undefined) {
+        renderCreditNote(resp.lowCredit, resp.balanceCredits, 'hosted');
+      }
       if (resp.systemNote) addSystemNote(messages, resp.systemNote);
       // The reveal above has already finished, so the host's hand-off pause is
       // just long enough to register the grant line before the pass starts.

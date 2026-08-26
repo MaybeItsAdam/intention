@@ -1269,7 +1269,78 @@ blockquote {
 }
 
 .settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
   margin-bottom: 24px;
+}
+
+.settings-header-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* The credit chip. On --raised with a hairline rather than in a --well: the
+   micro-label is 10px and --text-muted, which clears AA on white and lands
+   just under it on the recessed grey — and a chip that needs a magnifier is
+   not a readout. Same reason cards sit above the paper at all.
+
+   Two lines stacked, label over number, so the number is what the eye lands
+   on. No shadow, no fill: it is a piece of the page's furniture, not a
+   notification. */
+.credit-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--raised);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: right;
+}
+
+.credit-chip:hover {
+  border-color: var(--primary);
+  background: var(--primary-fill-soft);
+}
+
+.credit-chip .credit-chip-label {
+  margin: 0;
+}
+
+.credit-chip-value {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Running low reads as caution, not failure — the same tinted fill + border +
+   text of one hue every other status in the app uses. Zero never gets here:
+   that is locked, and the AI access card is already saying so. */
+.credit-chip-low {
+  border-color: var(--warning-line);
+  background: var(--warning-fill);
+}
+
+.credit-chip-low .credit-chip-value,
+.credit-chip-low .credit-chip-label {
+  color: var(--warning-text);
+}
+
+/* The painted chip stays the size it looks, and grows a touch target under it
+   rather than inflating. */
+@media (pointer: coarse) {
+  .credit-chip {
+    position: relative;
+    min-height: 44px;
+    justify-content: center;
+  }
 }
 
 .settings-header h1 {

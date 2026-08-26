@@ -33,6 +33,9 @@ const OVERLAY_CSS = `
   --success-fill: rgba(76, 195, 142, 0.12);
   --success-line: rgba(76, 195, 142, 0.45);
   --danger-text: #d62246;
+  --warning-text: #8a6200;
+  --warning-fill: rgba(255, 191, 0, 0.14);
+  --warning-line: rgba(255, 191, 0, 0.45);
   --scrim: rgba(20, 18, 26, 0.45);
   --radius-card: 8px;
   --radius-control: 6px;
@@ -53,6 +56,7 @@ const OVERLAY_CSS = `
     --primary-text: #66b2ff;
     --success-text: #4cc38e;
     --danger-text: #ff6b85;
+    --warning-text: #ffbf00;
     --scrim: rgba(0, 0, 0, 0.6);
   }
 }
@@ -245,6 +249,29 @@ const OVERLAY_CSS = `
 #intention-root .int-stat { display: flex; gap: 5px; }
 #intention-root .int-stat-value { color: var(--text-muted); font-weight: 600; }
 #intention-root .int-stat-label { color: var(--text-dim); }
+
+/* Coaching credit, above the conversation. Muted prose in the ordinary case
+   because a healthy balance is a fact and not an announcement; a bordered
+   amber chip once it is running low, which is the same tinted fill + border +
+   text of one hue that every other status in the app uses.
+
+   Amber and not raspberry, deliberately: nothing has failed. Zero credit is a
+   different state entirely and never reaches this element — it is locked, and
+   the paywall replaces the conversation instead. */
+#intention-root .int-credit-note {
+  margin: 0 0 22px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+#intention-root .int-credit-note.int-credit-note-low {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-control);
+  background: var(--warning-fill);
+  color: var(--warning-text);
+}
 
 /* System note: machinery speaking (a clamped grant, a cap hit), not the coach. */
 #intention-root .int-msg.int-system {

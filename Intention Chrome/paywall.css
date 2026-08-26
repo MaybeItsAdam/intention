@@ -119,7 +119,89 @@
   color: var(--text-muted);
 }
 
-.int-pw-restore, .int-pw-byok { width: 100%; }
+.int-pw-restore, .int-pw-byok, .int-pw-recover { width: 100%; }
+
+/* Running low. Amber, and worded as a heads-up rather than an alarm: nothing
+   has failed, and the buttons that fix it are directly underneath. */
+.int-pw-low {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-control);
+  background: var(--warning-fill);
+  color: var(--warning-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---- Recovery code ----
+   
+   Collapsed as a <details> where it is one durability route among several, and
+   as a plain open block where it is the only one there is (a browser, or the
+   moment credit has just landed). Both shapes share .int-pw-recovery so the
+   border and padding are written once. */
+.int-pw-recovery {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--raised);
+}
+
+.int-pw-recovery > summary,
+.int-pw-recovery > strong {
+  display: block;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.int-pw-recovery > strong { cursor: default; }
+
+.int-pw-recovery-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* The code itself: the one thing on the screen that has to be copied by hand
+   off a phone, so it is monospaced, spaced out, and selectable at a glance.
+   In a well rather than on the card, because it is the recessed thing here. */
+.int-pw-recovery-code {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  background: var(--well);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  word-break: break-all;
+  user-select: all;
+}
+
+.int-pw-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Both of these carry an explicit `display`, which beats the UA stylesheet's
+   `[hidden] { display: none }` — so without these two rules the code well and
+   its buttons stay on screen before anything has been fetched. This
+   stylesheet is loaded into coaching.html as well, which has no global
+   `[hidden]` rule of its own to fall back on. */
+.int-pw-recovery-code[hidden],
+.int-pw-recovery-actions[hidden] {
+  display: none;
+}
+
+.int-pw-recovery-actions button {
+  flex: 1 1 140px;
+}
 
 .int-pw-status strong {
   color: var(--ink);

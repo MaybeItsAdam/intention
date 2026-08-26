@@ -146,8 +146,21 @@
 
     <main id="settings-view" hidden>
       <div class="settings-header">
-        <h1>Intention</h1>
-        <p class="muted">Your coach, your sites, your rules.</p>
+        <div class="settings-header-text">
+          <h1>Intention</h1>
+          <p class="muted">Your coach, your sites, your rules.</p>
+        </div>
+        <!-- The balance, on every tab. It used to be reachable only from
+             inside the paywall, which is the one surface someone who has
+             already paid never opens again — "there seems to be no means to
+             see credit balance" was the entirely fair result. A button, not a
+             label: it goes to the card that can do something about it. Hidden
+             on builds using a custom API key, where there is no balance and a
+             "0" would be a lie. -->
+        <button type="button" id="credit-chip" class="credit-chip" hidden>
+          <span class="micro-label credit-chip-label">Credit</span>
+          <span class="credit-chip-value" id="credit-chip-value"></span>
+        </button>
       </div>
 
       <div id="section-tabs" class="settings-tabs section-tabs">
@@ -251,7 +264,7 @@
           <button id="ios-request-time-btn" class="secondary" style="width: 100%;" hidden>Ask your coach for time on a blocked app</button>
         </section>
 
-        <section class="card" data-section="settings">
+        <section class="card" data-section="settings" id="ai-access-card">
           <h2>AI access</h2>
           <div id="access-paywall"></div>
           <div id="access-status" class="status"></div>

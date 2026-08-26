@@ -200,6 +200,36 @@ function applyDeepLinkSection() {
   if (section === 'settings') document.getElementById('api-key-input-2')?.focus();
 }
 
+// The header credit chip: the balance, on every tab, on every settings open.
+//
+// It reads the background's own numbers rather than the stored entitlement,
+// because the two exclusions that make the chip honest are decided there and
+// must not be re-derived here — `lowCredit` is already false at zero (that is
+// locked, not low) and false on a custom key.
+//
+// Hidden outright on the 'byok' route. A user pointing the coach at their own
+// provider account has no balance with us at all, so a chip reading "0" would
+// not be a small inaccuracy, it would be the wrong mental model: it would tell
+// them they had run out of something they never bought.
+async function refreshCreditChip() {
+  const chip = document.getElementById('credit-chip');
+  if (!chip) return;
+  const access = await getAccessState();
+  if (!access || access.route === 'byok') {
+    chip.hidden = true;
+    return;
+  }
+  const credits = Number(access.balanceCredits || 0);
+  const shown = credits.toLocaleString();
+  document.getElementById('credit-chip-value').textContent = shown;
+  chip.classList.toggle('credit-chip-low', !!access.lowCredit);
+  // The two spans read as "CREDIT 1,240" to the eye and as nothing much to a
+  // screen reader, so it gets the sentence and the destination.
+  chip.setAttribute('aria-label', `Coaching credit: ${shown}. Open AI access.`);
+  chip.title = `Coaching credit: ${shown}. Open AI access.`;
+  chip.hidden = false;
+}
+
 function setSettingsSection(section) {
   activeSettingsSection = section;
   try { localStorage.setItem('activeSettingsSection', section); } catch (e) {}
@@ -633,6 +663,11 @@ async function showSettingsView(state) {
 
   await refreshAccessUI('access-paywall');
   wireAccessRefreshOnReturn('access-paywall');
+  await refreshCreditChip();
+  bindOnce('credit-chip', 'click', () => {
+    setSettingsSection('settings');
+    document.getElementById('ai-access-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 
   // ---- Advanced: custom API key ----
   wireCustomKeySection(state);

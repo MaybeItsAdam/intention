@@ -430,3 +430,66 @@ describe('the native billing clients agree with shared/providers.js on the backe
     expect(found[1]).toBe(sharedUrl);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Safari decodes background scripts as a single-byte charset
+// ---------------------------------------------------------------------------
+//
+// Chrome loads background.js into a service worker and Firefox into a page it
+// generates; both decode it as UTF-8. Safari generates its own background page
+// for `background.scripts` (manifest.apple.json) and that page declares no
+// charset, so the scripts are decoded as windows-1252 instead. Every byte of a
+// multi-byte character then becomes its own glyph: an em dash renders as three
+// characters, and the coach's own acceptance line came back to a user reading
+// "Okay a<euro>" you've got 3 minutes".
+//
+// It is not only cosmetic. prompts.js is a background script, so the same
+// mangling reaches the system prompt: on Safari the model was being handed
+// corrupted instructions, silently, on every conversation.
+//
+// The fix is to keep these files ASCII: the escape `\u2014` is six ASCII
+// characters that decode to the same em dash under any charset a browser might
+// pick, where the character itself does not. Comments are exempt because
+// nothing renders them. This test is the reason the escapes
+// stay: they read worse than the literal character and would otherwise be an
+// obvious thing to "clean up".
+//
+// It cannot be tested any other way from this repo. Nothing here runs Safari,
+// and the two engines that CI does run both get this right, so the bug is
+// invisible to every other check.
+describe('background scripts stay ASCII outside comments', () => {
+  const backgroundScripts = JSON.parse(
+    readFileSync(join(REPO_ROOT, 'shared', 'manifest.apple.json'), 'utf8')
+  ).background.scripts;
+
+  it('reads the file list from the manifest rather than a hand-kept copy', () => {
+    expect(backgroundScripts.length).toBeGreaterThan(0);
+    expect(backgroundScripts).toContain('prompts.js');
+  });
+
+  for (const file of backgroundScripts) {
+    it(`${file} has no non-ASCII character in a string or template literal`, async () => {
+      const { tokenizer } = await import('acorn');
+      const src = readFileSync(join(REPO_ROOT, 'shared', file), 'utf8');
+      const offenders = [];
+      for (const tok of tokenizer(src, { ecmaVersion: 'latest' })) {
+        if (tok.type.label !== 'string' && tok.type.label !== 'template') continue;
+        const raw = src.slice(tok.start, tok.end);
+        if (!/[^\x00-\x7F]/.test(raw)) continue;
+        const line = src.slice(0, tok.start).split('\n').length;
+        offenders.push(`${file}:${line} ${raw.slice(0, 60)}`);
+      }
+      expect(offenders).toEqual([]);
+    });
+  }
+
+  // The three variant directories are byte-identical copies of shared/, so an
+  // escape lost in a hand-edit to one of them would not show up above.
+  it('the shipped Apple copies match shared/ byte for byte', () => {
+    for (const file of backgroundScripts) {
+      const a = readFileSync(join(REPO_ROOT, 'shared', file));
+      const b = readFileSync(join(VARIANTS.apple, file));
+      expect(b.equals(a)).toBe(true);
+    }
+  });
+});

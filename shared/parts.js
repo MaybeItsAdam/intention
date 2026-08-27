@@ -1103,7 +1103,7 @@ const SCOPE_LABEL_MAX = 60;
 function clampScopeLabel(value) {
   const flat = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
   if (!flat) return '';
-  return flat.length > SCOPE_LABEL_MAX ? `${flat.slice(0, SCOPE_LABEL_MAX - 1)}…` : flat;
+  return flat.length > SCOPE_LABEL_MAX ? `${flat.slice(0, SCOPE_LABEL_MAX - 1)}\u2026` : flat;
 }
 
 // What to call a destination that has no title of its own.

@@ -2377,7 +2377,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
           : null;
         if (wantsPage && !scope) {
           systemNote = 'There was no single page to pin that to, so your pass covers the whole site for the full time.';
-          correction = 'Your grant_access call asked for scope "page", but Intention could not identify a single page to scope it to — the destination is a feed, an app, or its address was not recorded. The pass was granted for the WHOLE SITE instead. Tell the user that, honestly and in your own words.';
+          correction = 'Your grant_access call asked for scope "page", but Intention could not identify a single page to scope it to \u2014 the destination is a feed, an app, or its address was not recorded. The pass was granted for the WHOLE SITE instead. Tell the user that, honestly and in your own words.';
         }
 
         // Both caps are now absolute. Until the quick check was retired, a
@@ -2389,8 +2389,8 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         if (grantsLimitReached || minutesLimitReached) {
           const reasonStr = grantsLimitReached ? 'daily grant cap reached' : `absolute max of ${limits.maxMinutes} minutes reached`;
           systemNote = grantsLimitReached
-            ? 'Daily grant cap reached — no more time can be granted today.'
-            : `Absolute max of ${limits.maxMinutes} minutes reached — no more time can be granted today.`;
+            ? 'Daily grant cap reached \u2014 no more time can be granted today.'
+            : `Absolute max of ${limits.maxMinutes} minutes reached \u2014 no more time can be granted today.`;
           correction = `Your grant_access call was NOT applied: ${reasonStr}. No time can be granted today.`;
           continue;
         }
@@ -2430,7 +2430,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
         }
 
         if (minutes <= 0) {
-          systemNote = `Absolute max of ${limits.maxMinutes} minutes reached — no more time can be granted today.`;
+          systemNote = `Absolute max of ${limits.maxMinutes} minutes reached \u2014 no more time can be granted today.`;
           correction = `Your grant_access call was NOT applied: the user's daily minutes cap is already used up. No time can be granted today.`;
           continue;
         }
@@ -2442,10 +2442,10 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
           // is likewise replaced — one line, the most load-bearing fact.
           correction = `You asked for ${requested} minutes, but only ${minutes} were available under ${clampCause}. The pass was granted for ${minutes} minutes.`;
           systemNote = clampCause === "the user's daily minutes cap"
-            ? `Only ${minutes} minutes were available under your daily cap — your pass is ${minutes} minutes.`
+            ? `Only ${minutes} minutes were available under your daily cap \u2014 your pass is ${minutes} minutes.`
             : clampCause === STRICT_PHASE_CLAMP_CAUSE
-              ? `Your lenient window here is spent for today, so passes are capped at ${strictCap} minutes — your pass is ${minutes} minutes.`
-              : `Passes top out at 60 minutes — your pass is ${minutes} minutes.`;
+              ? `Your lenient window here is spent for today, so passes are capped at ${strictCap} minutes \u2014 your pass is ${minutes} minutes.`
+              : `Passes top out at 60 minutes \u2014 your pass is ${minutes} minutes.`;
         }
 
         const reason = String(input.reason || '').slice(0, 240);
@@ -2480,7 +2480,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       // grantSession runs) must be cleared too, or the honesty turn would
       // assert a grant that never actually landed.
       correction = '';
-      systemNote = 'Something went wrong applying that — try describing what you want again.';
+      systemNote = 'Something went wrong applying that \u2014 try describing what you want again.';
     }
   }
 
@@ -2497,29 +2497,29 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       // page only" and the re-gate that follows read as the tool going wrong
       // rather than as the thing they just agreed to.
       acceptanceFallback = grantedSession.scope
-        ? `Okay — you've got ${mins} minute${mins === 1 ? '' : 's'} on that page${r}. Leave it and the block comes straight back, and you keep the minutes you don't use.`
-        : `Okay — you've got ${mins} minute${mins === 1 ? '' : 's'}${r}. Make it count; I'll check in when the time's up.`;
+        ? `Okay \u2014 you've got ${mins} minute${mins === 1 ? '' : 's'} on that page${r}. Leave it and the block comes straight back, and you keep the minutes you don't use.`
+        : `Okay \u2014 you've got ${mins} minute${mins === 1 ? '' : 's'}${r}. Make it count; I'll check in when the time's up.`;
     } else if (settingApproved) {
-      if (changeType === 'remove' || changeType === 'remove_app') acceptanceFallback = `Alright, I'm convinced — I've removed ${displayName} from your blocklist.`;
-      else if (changeType === 'increase_limit' || changeType === 'increase_app_limit') acceptanceFallback = `Okay, you've made your case — I've raised your absolute max on ${displayName}.`;
-      else if (changeType === 'increase_loose_window' || changeType === 'increase_app_loose_window') acceptanceFallback = `Alright — I've lengthened the easy stretch on ${displayName}. I'll still ask what you're there for.`;
-      else if (changeType === 'edit_site_purpose' || changeType === 'edit_site_legitimate') acceptanceFallback = `Okay, that's a fair correction — I've saved your new wording for ${displayName}.`;
+      if (changeType === 'remove' || changeType === 'remove_app') acceptanceFallback = `Alright, I'm convinced \u2014 I've removed ${displayName} from your blocklist.`;
+      else if (changeType === 'increase_limit' || changeType === 'increase_app_limit') acceptanceFallback = `Okay, you've made your case \u2014 I've raised your absolute max on ${displayName}.`;
+      else if (changeType === 'increase_loose_window' || changeType === 'increase_app_loose_window') acceptanceFallback = `Alright \u2014 I've lengthened the easy stretch on ${displayName}. I'll still ask what you're there for.`;
+      else if (changeType === 'edit_site_purpose' || changeType === 'edit_site_legitimate') acceptanceFallback = `Okay, that's a fair correction \u2014 I've saved your new wording for ${displayName}.`;
       // Named rather than left to the generic line below, because "I've made
       // that change" after a conversation about which SECTIONS stay blocked
       // tells the user nothing about what is now open to them.
-      else if (changeType === 'narrow_block_scope' || changeType === 'narrow_app_block_scope') acceptanceFallback = `Alright — I've changed which parts of ${displayName} are blocked. The rest is yours.`;
-      else if (changeType === 'disable_all') acceptanceFallback = `Understood — I've turned off blocking for now. Be intentional with it.`;
+      else if (changeType === 'narrow_block_scope' || changeType === 'narrow_app_block_scope') acceptanceFallback = `Alright \u2014 I've changed which parts of ${displayName} are blocked. The rest is yours.`;
+      else if (changeType === 'disable_all') acceptanceFallback = `Understood \u2014 I've turned off blocking for now. Be intentional with it.`;
       // Two shapes, because approving a removal with a cool-off set does not
       // remove anything — and a farewell line under a screen that still says
       // "22 hours to go" would read as the button having failed.
       else if (changeType === 'uninstall') {
         const delay = formatLeaveDelay(settingApproved.delayMinutes);
         acceptanceFallback = delay
-          ? `Understood. Your ${delay} starts now — come back when it's up and it'll be one tap. I won't get in your way again before then.`
-          : `Understood. I've stepped out of the way — go ahead and remove it. Look after yourself.`;
+          ? `Understood. Your ${delay} starts now \u2014 come back when it's up and it'll be one tap. I won't get in your way again before then.`
+          : `Understood. I've stepped out of the way \u2014 go ahead and remove it. Look after yourself.`;
       }
-      else if (changeType === 'decrease_leave_delay') acceptanceFallback = `Alright — I've shortened the wait on removing Intention.`;
-      else acceptanceFallback = `Okay, I'm convinced — I've made that change.`;
+      else if (changeType === 'decrease_leave_delay') acceptanceFallback = `Alright \u2014 I've shortened the wait on removing Intention.`;
+      else acceptanceFallback = `Okay, I'm convinced \u2014 I've made that change.`;
     }
   }
   const firstText = rawText || acceptanceFallback;
@@ -2532,7 +2532,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
   // two consecutive same-role turns).
   let secondText = '';
   if (correction && (mode === 'gate' || mode === 'checkin')) {
-    history.push({ role: 'assistant', content: firstText || '(…)' });
+    history.push({ role: 'assistant', content: firstText || '(\u2026)' });
     history.push({ role: 'user', content: `(Intention: ${correction} Tell the user what actually happened, honestly and in your own words, and keep coaching. Do not repeat the request.)` });
     try {
       const second = await callLLM({
@@ -2553,14 +2553,14 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
       // has already been settled above, and honouring a fresh grant here
       // would reopen the loop this turn exists to close.
       secondText = (second.text || '').trim();
-      history.push({ role: 'assistant', content: secondText || '(…)' });
+      history.push({ role: 'assistant', content: secondText || '(\u2026)' });
     } catch (e) {
       console.warn('Intention: correction turn failed', e);
       secondText = '';
       history.pop();
     }
   } else {
-    history.push({ role: 'assistant', content: firstText || '(…)' });
+    history.push({ role: 'assistant', content: firstText || '(\u2026)' });
   }
 
   const assistantText = [firstText, secondText].filter(Boolean).join('\n\n');
@@ -2582,7 +2582,7 @@ async function handleChat({ tabId, mode, domain, isApp, appLabel, userMessage, c
   }
 
   return {
-    assistantText: assistantText || '(…)',
+    assistantText: assistantText || '(\u2026)',
     grantedSession,
     contextUpdated,
     approved: settingApproved ? true : false,

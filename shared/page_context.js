@@ -50,7 +50,7 @@ function clampField(value, max) {
     .replace(/\s+/g, ' ')
     .trim();
   if (flattened.length <= max) return flattened;
-  return flattened.slice(0, max).trim() + '…';
+  return flattened.slice(0, max).trim() + '\u2026';
 }
 
 // Applies the caps above to a whole context object, dropping anything empty.

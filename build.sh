@@ -205,10 +205,27 @@ build_safari() {
     build
   ok "Safari macOS build complete"
 
-  # Copy the .app if it exists
+  # Copy the .app out of derived data, then take the derived copy away again.
+  #
+  # Both halves matter. Safari lists one extension row per host app bundle it
+  # can see, and it finds them by bundle id, not by path — so leaving the
+  # build product sitting in derived data next to the copy we just made means
+  # two identical "Intention" rows in Safari's Extensions settings with no way
+  # to tell which is which. Removing the destination first rather than copying
+  # over it matters for the same reason it always does: cp -R merges, so a
+  # file dropped from the app in a later build would live on in the copy.
   APP_PATH=$(find "$BUILD_DIR/safari-derived" -name "*.app" -maxdepth 5 | head -1)
   if [[ -n "$APP_PATH" ]]; then
-    cp -R "$APP_PATH" "$BUILD_DIR/"
+    DEST="$BUILD_DIR/$(basename "$APP_PATH")"
+    rm -rf "$DEST"
+    cp -R "$APP_PATH" "$DEST"
+
+    # Tell LaunchServices before the bundle goes, or the record outlives it
+    # and Safari keeps offering a row that points at nothing.
+    LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+    [[ -x "$LSREGISTER" ]] && "$LSREGISTER" -u "$APP_PATH" 2>/dev/null || true
+    rm -rf "$APP_PATH"
+
     ok "Copied $(basename "$APP_PATH") to $BUILD_DIR/"
   fi
 }

@@ -335,7 +335,7 @@ against the shipped files at the end of it; where the code moved underneath
 one, the item was corrected rather than left standing (see §7.3, §7.5). The
 file paths are the contract.
 
-### 7.1 The macOS disable notice has never been seen
+### 7.1 The macOS disable notice, seen and confirmed
 
 `Intention Apple/macOS (App)/AppDelegate.swift` now imports `SafariServices`
 and calls `SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier:)`
@@ -364,15 +364,24 @@ Safari Settings** and **Leave It Off**; the first button calls
 button makes. It is presented as a sheet on our own window when there is one and
 a modal only when there is not.
 
-**None of that has been run.** CI's `apple` job builds the
-`Intention Safari (macOS)` scheme, so a *compile* error would fail the PR — but
-nothing on any machine we have has ever launched this app, turned the extension
-off, and watched the alert appear. Unverified specifically: whether
-`getStateOfSafariExtension` returns a usable state this early in
-`applicationDidFinishLaunching`; whether `applicationDidBecomeActive` fires often
-enough to catch a user who disables the extension while the app is open; and how
-the two-line `informativeText` sets in a sheet. A Mac with Safari, ten minutes,
-and the extension toggle is the whole verification.
+**Run on a Mac, 2026-08-29, and it works.** The sheet appears attached to the
+window, the two-line `informativeText` sets without clipping at the app's
+default 646pt width, and the notice re-arms: re-enabling the extension and
+bringing the app forward clears `…DisableNoticeShown`, so the next disable
+speaks again. `getStateOfSafariExtension` returns a usable state from both
+entry points. Verified against a locally built `build/Intention.app`, with the
+`UserDefaults` read back out of the app's sandbox container to confirm each
+transition rather than inferred from the alert alone.
+
+One property to keep in mind rather than fix. The re-arm needs the app to come
+to the *front* while the extension is enabled, because
+`applicationDidBecomeActive` and `applicationDidFinishLaunching` are the only
+two moments state is sampled. Someone who reads the notice, turns the extension
+back on in Safari and never returns to the app has not been observed as
+re-enabled, so a later disable stays quiet until the next app launch. That was
+mistaken for a defect on first pass; clicking between the two apps a few times
+re-arms it exactly as designed. It self-heals on launch, and the alternative —
+polling, or dropping the once-per-event guard — buys a nag. Left as is.
 
 Note that it deliberately does **not** touch
 `Shared (App)/Resources/Base.lproj/Main.html`. Adding a state line to that page

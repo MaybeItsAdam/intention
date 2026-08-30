@@ -564,7 +564,26 @@ function wireCustomKeySection(state) {
     modelInput.placeholder = p ? p.modelPlaceholder : '';
   };
 
+  // DEFAULT_PROVIDER was read by nothing at all: env.txt advertised it, the
+  // parser returned it, and no line in the codebase ever looked at the key.
+  // So a file that said `groq` still opened on Anthropic with an empty box,
+  // and the GROQ_API_KEY sitting right underneath was never reachable without
+  // first changing the dropdown by hand. Honoured once, on first load only,
+  // and only when there is no stored provider of the user's own -- applying it
+  // from the change handler too would silently undo every manual selection.
+  let envProviderApplied = false;
+
   const syncEnvSettings = (parsedEnv) => {
+    if (!envProviderApplied) {
+      envProviderApplied = true;
+      const stored = state.provider && state.provider !== HOSTED_PROVIDER ? state.provider : '';
+      const wanted = String(parsedEnv.DEFAULT_PROVIDER || '').trim().toLowerCase();
+      if (!stored && wanted && PROVIDERS[wanted] && !PROVIDERS[wanted].hosted) {
+        provSel.value = wanted;
+        syncPlaceholder();
+      }
+    }
+
     const provider = provSel.value;
     const providerKey = `${provider.toUpperCase()}_API_KEY`;
     const modelKey = `${provider.toUpperCase()}_MODEL`;

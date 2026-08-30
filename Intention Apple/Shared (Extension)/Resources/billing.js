@@ -619,7 +619,8 @@ function cleanProductDesc(title, desc) {
 // balance line instead of a lede.
 async function renderPaywall(container, opts = {}) {
   const { entitlement, onPurchase, onRestore, onRedeem, onRedeemStoreCode, onUseOwnKey, onSaveKey,
-    onShowRecoveryCode, onRecoverFromDevice, justPurchased, accountRestored, route, compact } = opts;
+    onShowRecoveryCode, onRecoverFromDevice, justPurchased, accountRestored, route, compact,
+    keyDefaults } = opts;
   container.innerHTML = '';
   container.className = 'int-paywall' + (compact ? ' int-paywall-compact' : '');
 
@@ -963,7 +964,7 @@ async function renderPaywall(container, opts = {}) {
   // rather than burying the key behind an "advanced" disclosure.
   const routes = el('div', 'int-pw-routes');
 
-  routes.appendChild(buildKeyRoute({ el, busy, setError, onSaveKey, onUseOwnKey }));
+  routes.appendChild(buildKeyRoute({ el, busy, setError, onSaveKey, onUseOwnKey, keyDefaults }));
   routes.appendChild(buildCodeRoute({ el, busy, setError, onRedeem }));
 
   container.appendChild(routes);
@@ -973,7 +974,7 @@ async function renderPaywall(container, opts = {}) {
 
 // Route 1: bring your own provider key. Finishable in place — the fields live
 // here rather than behind a jump into Settings -> Advanced.
-function buildKeyRoute({ el, busy, setError, onSaveKey, onUseOwnKey }) {
+function buildKeyRoute({ el, busy, setError, onSaveKey, onUseOwnKey, keyDefaults = null }) {
   const card = el('div', 'int-pw-route');
   card.appendChild(el('strong', null, 'Use your own API key'));
   card.appendChild(el('p', 'int-pw-sub',
@@ -1011,6 +1012,20 @@ function buildKeyRoute({ el, busy, setError, onSaveKey, onUseOwnKey }) {
 
   const saveBtn = el('button', 'primary', 'Save key');
   saveBtn.type = 'button';
+
+  // Development convenience only. The caller reads env.txt (a gitignored file
+  // that ships in no release build) and hands the values down; production
+  // finds no file, passes nothing, and this is a no-op. It lives here rather
+  // than in the caller because these two controls are built by this function
+  // and have no existence outside it -- the settings page's own key fields are
+  // different elements entirely, which is exactly why they were prefilled and
+  // this pair silently was not.
+  if (keyDefaults) {
+    if (keyDefaults.provider && PROVIDERS[keyDefaults.provider] && !PROVIDERS[keyDefaults.provider].hosted) {
+      provSel.value = keyDefaults.provider;
+    }
+    if (keyDefaults.apiKey) keyInput.value = keyDefaults.apiKey;
+  }
 
   card.append(provLabel, provSel, keyLabel, keyInput, saveBtn);
 
@@ -1066,9 +1081,6 @@ function buildCodeRoute({ el, busy, setError, onRedeem, storeMode = false }) {
   codeBtn.type = 'button';
 
   card.append(codeLabel, codeInput, codeBtn);
-  card.appendChild(el('p', 'int-pw-sub', storeMode
-    ? 'Paste the recovery code from your old device.'
-    : 'Generate a code in the app under Settings → AI access.'));
 
   codeBtn.addEventListener('click', async () => {
     const code = codeInput.value.trim();

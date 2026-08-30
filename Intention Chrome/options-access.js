@@ -167,6 +167,30 @@ function recoveredPatch(recovered) {
   return patch;
 }
 
+// Development convenience, and nothing else. env.txt is gitignored and is
+// stripped from every release artefact, so loadEnv() finds no file in a
+// shipped build and this returns null.
+//
+// It exists because the settings page's key card and the paywall's key card
+// are two different pairs of elements, and only the first was ever wired to
+// env.txt. `web-ext run` hands you a brand new profile on every single launch,
+// so onboarding always opened on the wrong provider with an empty key field
+// even with a perfectly good key sitting in the file beside it.
+async function envKeyDefaults() {
+  try {
+    if (typeof loadEnv !== 'function') return null;
+    const env = await loadEnv();
+    if (!env) return null;
+    const wanted = String(env.DEFAULT_PROVIDER || '').trim().toLowerCase();
+    const provider = wanted && PROVIDERS[wanted] && !PROVIDERS[wanted].hosted ? wanted : '';
+    const apiKey = (provider && env[`${provider.toUpperCase()}_API_KEY`]) || env.API_KEY || '';
+    if (!provider && !apiKey) return null;
+    return { provider, apiKey };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function refreshAccessUI(containerId, { compact = false } = {}) {
   const container = document.getElementById(containerId);
   if (!container) return;
@@ -178,6 +202,7 @@ async function refreshAccessUI(containerId, { compact = false } = {}) {
   await renderPaywall(container, {
     entitlement,
     compact,
+    keyDefaults: await envKeyDefaults(),
     // A custom key is access too, but it leaves no entitlement behind — without
     // this the paywall keeps asking for one after the key is already working.
     route: access?.route || null,

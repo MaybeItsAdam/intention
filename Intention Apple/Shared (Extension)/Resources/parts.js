@@ -1294,7 +1294,21 @@ function dnrUrlFilterFor(urlStr) {
     try { parsed = new URL(urlStr); } catch (e) { return ''; }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
     const base = `${parsed.origin}${parsed.pathname}`;
-    const unsafe = /[*^|]|[^\x20-\x7e]/;
+    // The three DNR pattern characters, raw AND percent-encoded.
+    //
+    // Which of them `new URL()` leaves alone is not ours to decide and is not
+    // stable: `^` joined the WHATWG path percent-encode set, so a caret in a
+    // path survives as `^` on one Node and arrives as `%5E` on the next. Test
+    // the raw forms only and the guard silently stops firing the moment the
+    // engine starts encoding -- which is worse than it sounds, because the
+    // filter that then gets emitted carries `%5E` while the URL Chrome
+    // actually matches against carries `^`, so the rule never fires and the
+    // page is not blocked at all. Giving up widens to the domain and fails
+    // closed; a filter that cannot match fails open.
+    //
+    // Deliberately not `[^\x20-\x7e]`-style broad: `%C3%A9` from a non-ASCII
+    // path is fine and must still produce a filter.
+    const unsafe = /[*^|]|%(?:2[aA]|5[eE]|7[cC])|[^\x20-\x7e]/;
     const withQuery = `${base}${parsed.search || ''}`;
     if (!unsafe.test(withQuery)) return `|${withQuery}|`;
     // The query held pattern syntax. Anchoring `base` alone would emit

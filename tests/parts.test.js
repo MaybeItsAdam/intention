@@ -918,6 +918,14 @@ describe('dnrUrlFilterFor', () => {
   it.each([
     ['https://example.com/a*b', 'a wildcard in the path'],
     ['https://example.com/a^b', 'a separator in the path'],
+    // The same URL as the line above, as a newer Node hands it back. `^` is in
+    // the WHATWG path percent-encode set now, so whether the raw or the encoded
+    // form reaches the guard depends on the engine -- CI went red on exactly
+    // this while the machine it was written on stayed green. Both are pinned so
+    // it cannot drift back.
+    ['https://example.com/a%5Eb', 'a percent-encoded separator in the path'],
+    ['https://example.com/a%2Ab', 'a percent-encoded wildcard in the path'],
+    ['https://example.com/a%7Cb', 'a percent-encoded anchor in the path'],
     ['https://example.com/a|b', 'an anchor in the path'],
     ['javascript:alert(1)', 'a javascript: url'],
     ['not a url', 'junk'],

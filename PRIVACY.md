@@ -1,6 +1,6 @@
 # Privacy Policy — Intention
 
-_Last updated: 2026-08-26_
+_Last updated: 2026-09-03_
 
 _Published at <https://maybeitssoftware.co.uk/intention/privacy> — that URL is what the App Store and Google Play listings point at, so this file is the source of it and any change here is a change to the published policy._
 
@@ -141,4 +141,6 @@ If Intention's data flows change (e.g. a new provider integration), this file wi
 
 ## Contact
 
-Questions about this policy: open an issue on the project's GitHub repository.
+Intention is published by **MaybeItsSoftware Ltd**, a company registered in the United Kingdom, which is the data controller for the limited processing described above.
+
+Questions about this policy: open an issue on the project's GitHub repository, or email <privacy@maybeitssoftware.co.uk>.

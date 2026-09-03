@@ -1369,6 +1369,15 @@ describe('a pass that runs out while the page sits still', () => {
   const checkedIn = (dom) =>
     dom.created.some(el => /your time is up/.test(el.textContent || ''));
 
+  // The two tests below run a pass past its end, and the badge ticks once a
+  // second, so 13 minutes of fake time is ~800 real timer callbacks with a
+  // microtask flush after each. That is CPU-bound work, not waiting: the file
+  // takes under a second on an idle machine but the default 5s timeout has
+  // been lost to a parallel Xcode build. A longer limit here keeps a busy
+  // machine from reading as a hang — nothing in these tests can actually
+  // block, since there is no real clock involved.
+  const EXPIRY_TIMEOUT_MS = 30000;
+
   it('takes the page over when the pass expires under it', async () => {
     vi.useFakeTimers();
     const dom = withPass({ session: scopedSession(), answer: null });
@@ -1380,7 +1389,7 @@ describe('a pass that runs out while the page sits still', () => {
 
     expect(badged(dom)).toBe(false);
     expect(checkedIn(dom)).toBe(true);
-  });
+  }, EXPIRY_TIMEOUT_MS);
 
   // The drift screen is a statement about a LIVE pass — "you have got 4:12
   // left, and it was for that video". Rendered off an expired one it froze at
@@ -1397,7 +1406,7 @@ describe('a pass that runs out while the page sits still', () => {
     expect(drifted(dom)).toBe(false);
     expect(dom.created.some(el => /0:00 left/.test(el.textContent || ''))).toBe(false);
     expect(checkedIn(dom)).toBe(true);
-  });
+  }, EXPIRY_TIMEOUT_MS);
 
   it('still drifts while the pass is genuinely running', async () => {
     vi.useFakeTimers();

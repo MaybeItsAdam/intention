@@ -23,6 +23,15 @@
 		5375E5AA0000000000008005 /* options-lists.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006005 /* options-lists.js */; };
 		5375E5AA0000000000008006 /* options-rows.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006006 /* options-rows.js */; };
 		5375E5AA0000000000008007 /* options-wizard.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006007 /* options-wizard.js */; };
+		5375E5AA0000000000009000 /* parts.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006000 /* parts.js */; };
+		5375E5AA0000000000009001 /* rules.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006001 /* rules.js */; };
+		5375E5AA0000000000009002 /* gate-ui.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006002 /* gate-ui.js */; };
+		5375E5AA0000000000009003 /* options-access.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006003 /* options-access.js */; };
+		5375E5AA0000000000009004 /* options-coach.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006004 /* options-coach.js */; };
+		5375E5AA0000000000009005 /* options-lists.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006005 /* options-lists.js */; };
+		5375E5AA0000000000009006 /* options-rows.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006006 /* options-rows.js */; };
+		5375E5AA0000000000009007 /* options-wizard.js in Resources */ = {isa = PBXBuildFile; fileRef = 5375E5AA0000000000006007 /* options-wizard.js */; };
+		5375E5AA0000000000009008 /* report.js in Resources */ = {isa = PBXBuildFile; fileRef = 5275E5AA0000000000005200 /* report.js */; };
 		BA10C0DE00000000000000B1 /* IntentionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA10C0DE000000000000FE01 /* IntentionStore.swift */; };
 		BA10C0DE00000000000000B2 /* IntentionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA10C0DE000000000000FE01 /* IntentionStore.swift */; };
 		BA10C0DE00000000000000C2 /* AppGroupConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C82B6114B5CE5FA7C5FCC52 /* AppGroupConfig.swift */; };
@@ -826,6 +835,15 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5375E5AA0000000000009000 /* parts.js in Resources */,
+				5375E5AA0000000000009001 /* rules.js in Resources */,
+				5375E5AA0000000000009002 /* gate-ui.js in Resources */,
+				5375E5AA0000000000009003 /* options-access.js in Resources */,
+				5375E5AA0000000000009004 /* options-coach.js in Resources */,
+				5375E5AA0000000000009005 /* options-lists.js in Resources */,
+				5375E5AA0000000000009006 /* options-rows.js in Resources */,
+				5375E5AA0000000000009007 /* options-wizard.js in Resources */,
+				5375E5AA0000000000009008 /* report.js in Resources */,
 				66B8D04E2FE985EF00BC0D7F /* Icon.png in Resources */,
 				66B8D0272FE985EE00BC0D7F /* LaunchScreen.storyboard in Resources */,
 				66B8D04C2FE985EF00BC0D7F /* Main.html in Resources */,

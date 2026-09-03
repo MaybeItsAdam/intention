@@ -1272,7 +1272,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Extension)/iOS (Extension).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Extension)/Info.plist";
@@ -1284,7 +1284,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1309,7 +1309,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Extension)/iOS (Extension).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Extension)/Info.plist";
@@ -1321,7 +1321,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1349,7 +1349,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (App)/iOS (App).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (App)/Info.plist";
@@ -1364,7 +1364,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1393,7 +1393,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (App)/iOS (App).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (App)/Info.plist";
@@ -1408,7 +1408,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1436,7 +1436,7 @@
 				CODE_SIGN_ENTITLEMENTS = "macOS (Extension)/macOS (Extension).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1452,7 +1452,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1476,7 +1476,7 @@
 				CODE_SIGN_ENTITLEMENTS = "macOS (Extension)/macOS (Extension).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1492,7 +1492,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1518,7 +1518,7 @@
 				CODE_SIGN_ENTITLEMENTS = "macOS (App)/macOS (App).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1535,7 +1535,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1564,7 +1564,7 @@
 				CODE_SIGN_ENTITLEMENTS = "macOS (App)/macOS (App).entitlements";
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1581,7 +1581,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 10.14;
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				OTHER_LDFLAGS = (
 					"-framework",
 					SafariServices,
@@ -1608,7 +1608,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Monitor Extension)/Monitor Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Monitor Extension)/Info.plist";
@@ -1620,7 +1620,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Monitor;
 				PRODUCT_NAME = "Intention Monitor Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Monitor";
@@ -1641,7 +1641,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Monitor Extension)/Monitor Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Monitor Extension)/Info.plist";
@@ -1653,7 +1653,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Monitor;
 				PRODUCT_NAME = "Intention Monitor Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Monitor";
@@ -1675,7 +1675,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Shield Extension)/Shield Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Shield Extension)/Info.plist";
@@ -1687,7 +1687,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Shield;
 				PRODUCT_NAME = "Intention Shield Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Shield";
@@ -1708,7 +1708,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Shield Extension)/Shield Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Shield Extension)/Info.plist";
@@ -1720,7 +1720,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Shield;
 				PRODUCT_NAME = "Intention Shield Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Shield";
@@ -1742,7 +1742,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Shield Action Extension)/Shield Action Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Shield Action Extension)/Info.plist";
@@ -1754,7 +1754,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.ShieldAction;
 				PRODUCT_NAME = "Intention Shield Action Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.ShieldAction";
@@ -1775,7 +1775,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Shield Action Extension)/Shield Action Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Shield Action Extension)/Info.plist";
@@ -1787,7 +1787,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.ShieldAction;
 				PRODUCT_NAME = "Intention Shield Action Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.ShieldAction";
@@ -1809,7 +1809,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Report Extension)/Report Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Report Extension)/Info.plist";
@@ -1821,7 +1821,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Report;
 				PRODUCT_NAME = "Intention Report Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Report";
@@ -1843,7 +1843,7 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS (Report Extension)/Report Extension.entitlements";
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Report Extension)/Info.plist";
@@ -1855,7 +1855,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Report;
 				PRODUCT_NAME = "Intention Report Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Report";
@@ -1877,7 +1877,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Widget Extension)/Info.plist";
@@ -1889,7 +1889,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Widget;
 				PRODUCT_NAME = "Intention Widget Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Widget";
@@ -1910,7 +1910,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Distribution";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEVELOPMENT_TEAM = 6NQNU5YSC2;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Widget Extension)/Info.plist";
@@ -1922,7 +1922,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 0.22.1;
+				MARKETING_VERSION = 0.23.0;
 				PRODUCT_BUNDLE_IDENTIFIER = uk.co.maybeitssoftware.intention.Widget;
 				PRODUCT_NAME = "Intention Widget Extension";
 				PROVISIONING_PROFILE_SPECIFIER = "match AppStore uk.co.maybeitssoftware.intention.Widget";

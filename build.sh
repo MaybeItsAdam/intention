@@ -114,6 +114,17 @@ print('\n'.join(sorted(n for n in names if n)))
         || fail "$resource is used by the Apple extension but not referenced in the Xcode project — it will be missing from the built extension"
     done <<< "$MANIFEST_RESOURCES"
     ok "Xcode project bundles every resource the Apple extension uses"
+
+    # ...but the grep above only proves the filename appears SOMEWHERE in the
+    # project file, and membership is per target. Every file missing from the
+    # iOS app target in 0.22.1 was in this project file already, as a member of
+    # the extension targets, so that check passed while the app shipped without
+    # the eight scripts options.html loads and opened to a blank page. Apple
+    # rejected it under 2.1(a). This one reads each target's own Resources
+    # build phase.
+    python3 scripts/check-xcode-bundle.py \
+      || fail "An Xcode target is missing files its own HTML pages load (see above)"
+    ok "Every Xcode target bundles what its own pages load"
   fi
 
   # Verify every platform matches shared/ (single source of truth).

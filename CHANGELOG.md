@@ -1,3 +1,9 @@
+## [0.23.1](https://github.com/MaybeItsSoftware/intention/compare/v0.23.0...v0.23.1) (2026-09-03)
+
+### Bug Fixes
+
+* **apple:** ship the nine files the iOS app itself was built without ([1138ede](https://github.com/MaybeItsSoftware/intention/commit/1138ede818102f75aa470424438f0cd04c3e9815))
+
 ## [0.23.0](https://github.com/MaybeItsSoftware/intention/compare/v0.22.1...v0.23.0) (2026-09-03)
 
 ### Features

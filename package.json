@@ -43,6 +43,7 @@
     "@semantic-release/git": "^10.0.1",
     "@vitest/coverage-v8": "^2.1.9",
     "acorn": "^8.18.0",
+    "conventional-changelog-conventionalcommits": "9.3.1",
     "eslint": "^9.39.5",
     "globals": "^17.11.0",
     "http-server": "^14.1.1",
